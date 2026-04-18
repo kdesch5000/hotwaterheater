@@ -58,7 +58,7 @@
 
 // Temperature cycle detection
 #define CYCLE_TEMP_RISE_THRESHOLD 2.0   // 2 degrees F rise
-#define CYCLE_DETECT_WINDOW_MS   120000 // 2 minutes
+#define CYCLE_DETECT_WINDOW_MS   300000 // 5 minutes
 
 // WiFi AP defaults
 #define AP_SSID     "WaterHeaterMonitor"
@@ -581,14 +581,14 @@ void processTemperature() {
 }
 
 void detectHeatingCycle() {
-  if (g_tempHistCount < 12) return;  // Need at least 2 minutes of data
+  if (g_tempHistCount < 30) return;  // Need at least 5 minutes of data
 
-  // Calculate temperature rise over last 2 minutes (12 readings at 10s)
-  int oldest = (g_tempHistIdx - 12 + 60) % 60;
+  // Calculate temperature rise over last 5 minutes (30 readings at 10s)
+  int oldest = (g_tempHistIdx - 30 + 60) % 60;
   float tempRise = g_currentTempF - g_tempHistory2Min[oldest];
 
   if (!g_burnerActive) {
-    // Detect burner ON: temperature rising >2F in 2 minutes
+    // Detect burner ON: temperature rising >2F in 5 minutes
     if (tempRise > CYCLE_TEMP_RISE_THRESHOLD) {
       g_burnerActive = true;
       g_cycleStartTime = millis();
