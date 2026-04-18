@@ -603,7 +603,8 @@ void detectHeatingCycle() {
       g_cyclePeakTemp = g_currentTempF;
     }
 
-    // Detect burner OFF: temperature stops rising or falls
+    // Detect burner OFF: 5-min slope has gone flat or negative
+    // (temp stopped climbing = burner is no longer heating)
     if (tempRise <= 0.0) {
       g_burnerActive = false;
 
@@ -1186,7 +1187,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   .status-bar .ok { color: #4caf50; } .status-bar .warn { color: #ff9800; } .status-bar .err { color: #f44336; }
   label { display: block; margin: 8px 0 4px; font-size: 0.9em; color: #aaa; }
   input[type="text"], input[type="password"], input[type="number"], select {
-    width: 100%%; padding: 10px; background: #16213e; border: 1px solid #333;
+    width: auto; padding: 10px; background: #16213e; border: 1px solid #333;
     border-radius: 6px; color: #e0e0e0; font-size: 1em; }
   input:focus, select:focus { border-color: #00d4ff; outline: none; }
   .row { display: flex; gap: 12px; } .row > div { flex: 1; }
@@ -1208,6 +1209,8 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <h1>Water Heater Monitor</h1>
 
 <div class="status-bar" id="statusBar">Loading status...</div>
+
+<div id="chartsContainer"></div>
 
 <form id="configForm" method="POST" action="/config">
 
@@ -1324,7 +1327,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <br>
-<button type="submit" class="btn btn-primary" style="width:100%%;">Save & Reboot</button>
+<button type="submit" class="btn btn-primary" style="display:block;width:auto;">Save & Reboot</button>
 </form>
 
 <div style="margin-top:16px; text-align:center;">
@@ -1366,9 +1369,100 @@ var loadStatus=function(){
 };
 loadStatus();
 setInterval(loadStatus,10000);
+
 </script>
+<script src="/charts.js"></script>
 </body>
 </html>
+)rawliteral";
+
+const char CHARTS_JS[] PROGMEM = R"rawliteral(
+(function(){
+  var ct=document.getElementById('chartsContainer');
+  ct.innerHTML=
+    '<div class="card"><h2 style="margin-top:0">Temperature History</h2>'+
+    '<canvas id="tempChart" width="560" height="200" style="width:100%;height:200px"></canvas>'+
+    '<div style="display:flex;justify-content:space-between;color:#888;font-size:0.8em;margin-top:4px">'+
+    '<span id="tempTimeStart">\u2014</span><span id="tempTimeEnd">Now</span></div></div>'+
+    '<div class="card"><h2 style="margin-top:0">Heating Cycles (24h)</h2>'+
+    '<canvas id="cycleChart" width="560" height="120" style="width:100%;height:120px"></canvas>'+
+    '<div style="display:flex;justify-content:space-between;color:#888;font-size:0.8em;margin-top:4px">'+
+    '<span>24h ago</span><span>Now</span></div>'+
+    '<div id="cycleSummary" style="color:#aaa;font-size:0.85em;margin-top:6px"></div></div>';
+
+  function drawTempChart(readings,interval){
+    var c=document.getElementById('tempChart');
+    var ctx=c.getContext('2d');
+    var W=c.width,H=c.height;
+    var pad={t:10,b:25,l:45,r:10};
+    var gw=W-pad.l-pad.r,gh=H-pad.t-pad.b;
+    ctx.clearRect(0,0,W,H);
+    if(!readings||readings.length<2){
+      ctx.fillStyle='#555';ctx.font='14px sans-serif';ctx.textAlign='center';
+      ctx.fillText('Collecting data...',W/2,H/2);return;
+    }
+    var mn=999,mx=-999;
+    for(var i=0;i<readings.length;i++){if(readings[i]<mn)mn=readings[i];if(readings[i]>mx)mx=readings[i];}
+    var rng=mx-mn;if(rng<5){mn-=2.5;mx+=2.5;rng=5;}mn-=1;mx+=1;rng=mx-mn;
+    ctx.strokeStyle='#333';ctx.lineWidth=1;
+    for(var g=0;g<=4;g++){
+      var y=pad.t+gh-g/4*gh;
+      ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+gw,y);ctx.stroke();
+      ctx.fillStyle='#888';ctx.font='11px sans-serif';ctx.textAlign='right';
+      ctx.fillText((mn+rng*g/4).toFixed(1),pad.l-4,y+4);
+    }
+    ctx.beginPath();ctx.lineWidth=2;
+    for(var i=0;i<readings.length;i++){
+      var x=pad.l+(i/(readings.length-1))*gw;
+      var y=pad.t+gh-(readings[i]-mn)/rng*gh;
+      if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    }
+    ctx.strokeStyle='#00d4ff';ctx.stroke();
+    ctx.lineTo(pad.l+gw,pad.t+gh);ctx.lineTo(pad.l,pad.t+gh);ctx.closePath();
+    ctx.fillStyle='rgba(0,212,255,0.1)';ctx.fill();
+    var totalMin=readings.length*interval/60;
+    document.getElementById('tempTimeStart').textContent=Math.round(totalMin/60)+'h '+Math.round(totalMin%60)+'m ago';
+  }
+
+  function drawCycleChart(hourly){
+    var c=document.getElementById('cycleChart');
+    var ctx=c.getContext('2d');
+    var W=c.width,H=c.height;
+    var pad={t:10,b:5,l:10,r:10};
+    var gw=W-pad.l-pad.r,gh=H-pad.t-pad.b;
+    ctx.clearRect(0,0,W,H);
+    if(!hourly||hourly.length===0)return;
+    var last24=hourly.slice(-24);
+    var mx=0;for(var i=0;i<last24.length;i++){if(last24[i]>mx)mx=last24[i];}
+    if(mx===0)mx=1;
+    var bw=Math.floor(gw/last24.length)-2;
+    var totalMin=0;
+    for(var i=0;i<last24.length;i++){
+      var val=last24[i];totalMin+=val;
+      var bh=Math.max(val>0?2:0,val/mx*gh);
+      var x=pad.l+i*(bw+2);
+      var y=pad.t+gh-bh;
+      if(val>mx*0.7)ctx.fillStyle='#f44336';
+      else if(val>mx*0.4)ctx.fillStyle='#ff9800';
+      else if(val>0)ctx.fillStyle='#4caf50';
+      else ctx.fillStyle='#333';
+      ctx.fillRect(x,y,bw,bh);
+    }
+    document.getElementById('cycleSummary').textContent='Total heating: '+Math.round(totalMin)+'min in last 24h';
+  }
+
+  function loadHistory(){
+    fetch('/api/history')
+      .then(function(r){return r.json();})
+      .then(function(d){
+        drawTempChart(d.temperature_log.readings,d.temperature_log.interval_sec);
+        drawCycleChart(d.hourly_heat_minutes);
+      })
+      .catch(function(){});
+  }
+  loadHistory();
+  setInterval(loadHistory,60000);
+})();
 )rawliteral";
 
 String templateProcessor(const String& var) {
@@ -1405,6 +1499,11 @@ void setupWebServer() {
   // Config page
   g_server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send_P(200, "text/html", CONFIG_HTML, templateProcessor);
+  });
+
+  // Charts JS — served WITHOUT template processor to avoid % mangling
+  g_server.on("/charts.js", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "application/javascript", CHARTS_JS);
   });
 
   // Config form submission
