@@ -1,0 +1,8 @@
+# Build artifacts
+water_heater_monitor/build/
+
+# Shell session logs
+typescript
+
+# Claude local settings
+.claude/settings.local.json
