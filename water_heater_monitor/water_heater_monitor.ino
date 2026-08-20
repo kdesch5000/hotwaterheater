@@ -1,4 +1,4 @@
-// v1.6.3 — 2026-08-20
+// v1.7.0 — 2026-08-20
 /*******************************************************************************
  * WATER HEATER MONITOR — ESP32 T-Display S3
  *
@@ -94,6 +94,12 @@
 #define DEFAULT_SYSLOG_HOST "netwatch.mf"
 #define DEFAULT_SYSLOG_PORT 514
 
+// Heartbeat: a periodic "still alive" syslog line carrying current state.
+// Without it, a dead device is indistinguishable from a quiet one — every
+// other syslog emission here is edge-triggered, so a healthy week is silent.
+// Alert on the ABSENCE of these on the collector side.
+#define DEFAULT_HEARTBEAT_MIN 15
+
 /*******************************************************************************
  * DATA STRUCTURES
  ******************************************************************************/
@@ -165,6 +171,7 @@ struct Config {
   bool syslogEnabled;
   char syslogHost[64];
   uint16_t syslogPort;
+  uint16_t heartbeatMin;     // Syslog heartbeat interval in minutes; 0 = off
   bool eventLogEnabled;      // Persist events to FFat
 };
 
@@ -296,6 +303,9 @@ bool g_tempCritActive = false;
 bool g_tempReadFailed = false;
 bool g_wifiWasConnected = true;
 
+// Syslog heartbeat
+unsigned long g_lastHeartbeat = 0;
+
 // AP-mode station retry state
 unsigned long g_lastApRetry = 0;
 unsigned long g_apRetryStart = 0;
@@ -417,7 +427,7 @@ void sendSyslog(EventSeverity sev, const char* category, const char* message) {
     strftime(timestamp, sizeof(timestamp), "%b %e %H:%M:%S", &timeinfo);
   }
 
-  char packet[320];
+  char packet[448];  // Headroom for the heartbeat, which is longer than an event
   snprintf(packet, sizeof(packet), "<%u>%s %s %s: [%s] %s",
            pri, timestamp, SYSLOG_APPNAME, SYSLOG_APPNAME, category, message);
 
@@ -425,6 +435,56 @@ void sendSyslog(EventSeverity sev, const char* category, const char* message) {
     g_syslogUdp.write((const uint8_t*)packet, strlen(packet));
     g_syslogUdp.endPacket();
   }
+}
+
+// Periodic "still alive" line to syslog, carrying a full state snapshot.
+//
+// Syslog ONLY — deliberately not written to the FFat event log, which exists
+// for rare notable occurrences; 96 heartbeats a day would bury them (the same
+// reason heating cycles are excluded).
+//
+// Alerting is the collector's job: page when these STOP arriving. A device that
+// has died, wedged, or is stuck in AP mode goes silent, and silence is
+// otherwise indistinguishable from a healthy, uneventful week.
+void sendHeartbeat() {
+  if (g_cfg.heartbeatMin == 0) return;
+  if (!g_cfg.syslogEnabled || !g_wifiConnected) return;
+
+  unsigned long now = millis();
+  uint32_t interval = (uint32_t)g_cfg.heartbeatMin * 60000UL;
+  if (g_lastHeartbeat != 0 && now - g_lastHeartbeat < interval) return;
+  g_lastHeartbeat = now;
+
+  const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
+
+  char tempStr[16];
+  if (isnan(g_currentTempF)) strlcpy(tempStr, "n/a", sizeof(tempStr));
+  else snprintf(tempStr, sizeof(tempStr), "%.1f", g_currentTempF);
+
+  int cycles; uint32_t heatSec;
+  getCyclesToday(cycles, heatSec);
+
+  // key=value so it greps and parses cleanly on the collector
+  char msg[288];
+  snprintf(msg, sizeof(msg),
+           "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
+           "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s",
+           g_confirmedFlashCode,
+           info ? info->text : "Unknown",
+           tempStr,
+           g_burnerActive ? "on" : "off",
+           cycles,
+           (unsigned long)(heatSec / 60),
+           WiFi.RSSI(),
+           (unsigned long)((millis() - g_bootTime) / 1000),
+           (unsigned long)ESP.getFreeHeap(),
+           g_ffatMounted ? "ok" : "unmounted");
+
+  // Raise severity when the heater itself is unhappy, so a collector-side rule
+  // can act on a heartbeat's contents as well as its absence.
+  EventSeverity sev = (g_confirmedFlashCode == 1) ? EV_INFO
+                                                  : severityForFlashCode(g_confirmedFlashCode);
+  sendSyslog(sev, "heartbeat", msg);
 }
 
 // Keep the log bounded: when the active file hits the cap, it becomes the
@@ -632,6 +692,7 @@ void loadConfig() {
   g_cfg.syslogEnabled      = g_prefs.getBool("sysEn", true);
   strlcpy(g_cfg.syslogHost,     g_prefs.getString("sysHost", DEFAULT_SYSLOG_HOST).c_str(), sizeof(g_cfg.syslogHost));
   g_cfg.syslogPort         = g_prefs.getUShort("sysPort", DEFAULT_SYSLOG_PORT);
+  g_cfg.heartbeatMin       = g_prefs.getUShort("hbMin", DEFAULT_HEARTBEAT_MIN);
   g_cfg.eventLogEnabled    = g_prefs.getBool("evtEn", true);
 
   g_prefs.end();
@@ -668,6 +729,7 @@ void saveConfig() {
   g_prefs.putBool("sysEn",      g_cfg.syslogEnabled);
   g_prefs.putString("sysHost",  g_cfg.syslogHost);
   g_prefs.putUShort("sysPort",  g_cfg.syslogPort);
+  g_prefs.putUShort("hbMin",    g_cfg.heartbeatMin);
   g_prefs.putBool("evtEn",      g_cfg.eventLogEnabled);
 
   g_prefs.end();
@@ -1876,6 +1938,9 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
     <input type="number" name="sysPort" value="%SYS_PORT%" min="1" max="65535">
   </div>
 </div>
+<label>Heartbeat Interval (minutes, 0 = off)</label>
+<input type="number" name="hbMin" value="%HB_MIN%" min="0" max="1440">
+<div style="color:#8a8aa0;font-size:0.8em;margin:-8px 0 10px">Periodic &quot;still alive&quot; syslog line with current state. Alert on these <em>stopping</em> &mdash; every other syslog message here is edge-triggered, so a healthy device is otherwise silent. Not written to the event log.</div>
 <div style="margin-bottom:10px">
   <button type="button" onclick="testSyslog()">Send Test Message</button>
   <a href="/events" style="color:#00d4ff;margin-left:10px">View Event Log &rarr;</a>
@@ -2303,6 +2368,7 @@ String templateProcessor(const String& var) {
   if (var == "SYS_EN")       return g_cfg.syslogEnabled ? "checked" : "";
   if (var == "SYS_HOST")     return g_cfg.syslogHost;
   if (var == "SYS_PORT")     return String(g_cfg.syslogPort);
+  if (var == "HB_MIN")       return String(g_cfg.heartbeatMin);
   if (var == "SCR_ROT")      return String(g_cfg.screenRotationSec);
   if (var == "BRIGHT")       return String(g_cfg.brightness);
   if (var == "SE0") return g_cfg.screensEnabled[0] ? "checked" : "";
@@ -2367,6 +2433,8 @@ void setupWebServer() {
       strlcpy(g_cfg.syslogHost, request->getParam("sysHost", true)->value().c_str(), sizeof(g_cfg.syslogHost));
     if (request->hasParam("sysPort", true))
       g_cfg.syslogPort = request->getParam("sysPort", true)->value().toInt();
+    if (request->hasParam("hbMin", true))
+      g_cfg.heartbeatMin = request->getParam("hbMin", true)->value().toInt();
     if (request->hasParam("scrRotSec", true))
       g_cfg.screenRotationSec = request->getParam("scrRotSec", true)->value().toInt();
     g_cfg.screensEnabled[0] = request->hasParam("scrEn0", true);
@@ -2501,6 +2569,8 @@ void setupWebServer() {
     sl["enabled"] = g_cfg.syslogEnabled;
     sl["host"] = g_cfg.syslogHost;
     sl["port"] = g_cfg.syslogPort;
+    sl["heartbeat_min"] = g_cfg.heartbeatMin;
+    sl["heartbeat_age_sec"] = g_lastHeartbeat ? (millis() - g_lastHeartbeat) / 1000 : -1;
 
     JsonObject tm = doc["time"].to<JsonObject>();
     tm["tz"] = g_cfg.tzString;
@@ -2656,6 +2726,10 @@ void setupWebServer() {
       return;
     }
     sendSyslog(EV_INFO, "test", "Syslog test message from water heater monitor");
+    // Also emit a real heartbeat, so the exact line the collector will see on
+    // an ongoing basis can be verified now rather than after waiting an interval
+    g_lastHeartbeat = 0;
+    sendHeartbeat();
     JsonDocument doc;
     doc["sent"] = true;
     doc["host"] = g_cfg.syslogHost;
@@ -2839,6 +2913,9 @@ void loop() {
 
   // Home Assistant push
   pushToHomeAssistant();
+
+  // Periodic syslog heartbeat (dead-man's switch)
+  sendHeartbeat();
 
   // ElegantOTA
   ElegantOTA.loop();
