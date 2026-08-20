@@ -1,4 +1,4 @@
-// v1.5.4 — 2026-04-25 21:16
+// v1.6.3 — 2026-08-20
 /*******************************************************************************
  * WATER HEATER MONITOR — ESP32 T-Display S3
  *
@@ -26,6 +26,10 @@
 #include <ElegantOTA.h>
 #include <HTTPClient.h>
 #include <ArduinoOTA.h>
+#include <FFat.h>
+#include <WiFiUdp.h>
+#include <esp_system.h>
+#include <stdarg.h>
 
 /*******************************************************************************
  * PIN DEFINITIONS
@@ -64,11 +68,31 @@
 #define AP_SSID     "WaterHeaterMonitor"
 #define AP_PASSWORD "configure"
 #define AP_IP       IPAddress(192, 168, 4, 1)
+#define AP_RETRY_INTERVAL_MS 120000  // Re-attempt the configured network every 2 min
+#define AP_RETRY_TIMEOUT_MS  30000   // Give each attempt 30s before falling back
 
-// NTP
-#define NTP_SERVER  "pool.ntp.org"
-#define GMT_OFFSET  -18000  // US Central (-5h) — configurable later
-#define DST_OFFSET  3600
+// NTP / timezone
+// POSIX TZ string handles DST transitions automatically — no fixed offsets.
+// Default is US Central: CST (UTC-6), CDT (UTC-5), DST 2nd Sun Mar → 1st Sun Nov.
+#define NTP_SERVER_1    "pool.ntp.org"
+#define NTP_SERVER_2    "time.nist.gov"
+#define DEFAULT_TZ      "CST6CDT,M3.2.0/2,M11.1.0/2"
+#define NTP_SYNC_EPOCH  1700000000  // Any time_t below this means NTP hasn't landed yet
+
+// Persistent event log (FFat)
+// The board's partition table has a 9.875MB "ffat" partition and no SPIFFS/LittleFS
+// partition. Repartitioning requires a USB flash, so FFat is the only OTA-safe choice.
+#define EVENT_LOG_PATH      "/events.jsonl"
+#define EVENT_LOG_PREV_PATH "/events.1.jsonl"
+#define EVENT_LOG_MAX_BYTES 524288  // 512KB per file, 2 files kept (~12k events)
+#define EVENT_PENDING_MAX   16      // Events buffered in RAM until NTP provides a wall clock
+#define EVENT_READ_BYTES    192     // Assumed bytes/event when seeking back for a tail read
+
+// Syslog (RFC 3164 over UDP)
+#define SYSLOG_FACILITY   1    // user-level messages
+#define SYSLOG_APPNAME    "waterheater"
+#define DEFAULT_SYSLOG_HOST "netwatch.mf"
+#define DEFAULT_SYSLOG_PORT 514
 
 /*******************************************************************************
  * DATA STRUCTURES
@@ -110,6 +134,10 @@ struct HeatingCycle {
   bool active;
 };
 
+// Sentinel emitted in the config page in place of secret values. When POSTed back
+// unchanged, the existing stored value is preserved — keeps secrets out of the rendered HTML.
+#define SECRET_SENTINEL "__unchanged__"
+
 // System configuration (stored in Preferences)
 struct Config {
   char wifiSSID[64];
@@ -132,12 +160,48 @@ struct Config {
   uint8_t dimStartHour;
   uint8_t dimEndHour;
   uint16_t lightBaseline;
+  char tzString[48];         // POSIX TZ, e.g. "CST6CDT,M3.2.0/2,M11.1.0/2"
+  char ntpServer[64];
+  bool syslogEnabled;
+  char syslogHost[64];
+  uint16_t syslogPort;
+  bool eventLogEnabled;      // Persist events to FFat
 };
 
-// Log entry
+// Log entry (volatile RAM ring — diagnostics, served by /api/log)
 struct LogEntry {
   time_t timestamp;
   char message[128];
+};
+
+/*******************************************************************************
+ * EVENT LOG
+ *
+ * Notable, infrequent occurrences (flash code changes, temperature threshold
+ * crossings, sensor failures, boots, WiFi transitions). Written to FFat as
+ * JSON Lines so the record survives reboots, and mirrored to syslog so it
+ * survives the ESP32 itself. Heating cycles are deliberately NOT events —
+ * at 8-16/day they would bury the things you actually want to see.
+ ******************************************************************************/
+enum EventSeverity {
+  EV_INFO,
+  EV_WARNING,
+  EV_ERROR,
+  EV_CRITICAL
+};
+
+// Maps to syslog severity: info=6, warning=4, error=3, critical=2
+const uint8_t EVENT_SYSLOG_SEVERITY[] = {6, 4, 3, 2};
+const char* const EVENT_SEVERITY_NAME[] = {"INFO", "WARNING", "ERROR", "CRITICAL"};
+
+// An event held in RAM because NTP had not yet supplied a wall clock when it
+// occurred. Backfilled with a real timestamp once sync lands.
+struct PendingEvent {
+  unsigned long uptimeMs;
+  EventSeverity severity;
+  char category[16];
+  char message[128];
+  float tempF;
 };
 
 /*******************************************************************************
@@ -218,6 +282,37 @@ LogEntry g_log[MAX_LOG_ENTRIES];
 int g_logHead = 0;
 int g_logCount = 0;
 
+// Event log state
+bool g_ffatMounted = false;
+bool g_timeSynced = false;
+uint32_t g_eventCount = 0;        // Events written to FFat this boot
+PendingEvent g_pendingEvents[EVENT_PENDING_MAX];
+int g_pendingEventCount = 0;
+WiFiUDP g_syslogUdp;
+
+// Threshold-crossing edge state, so we log the crossing rather than every reading
+bool g_tempWarnActive = false;
+bool g_tempCritActive = false;
+bool g_tempReadFailed = false;
+bool g_wifiWasConnected = true;
+
+// AP-mode station retry state
+unsigned long g_lastApRetry = 0;
+unsigned long g_apRetryStart = 0;
+bool g_apRetryInProgress = false;
+
+// Set by POST /api/events/format, acted on in loop(). The format must not run
+// inside the AsyncTCP handler — it blocks for seconds with the WDT disabled.
+volatile bool g_formatRequested = false;
+
+// Queued HA event. logEvent() only sets the flag; the HTTP POST happens in
+// pushToHomeAssistant(), which already runs in a context where blocking is
+// expected. Keeps network latency out of the flash-detection state machine.
+bool g_haEventPending = false;
+EventSeverity g_haEventSeverity = EV_INFO;
+char g_haEventCategory[16] = "";
+char g_haEventMessage[128] = "";
+
 // WiFi state
 bool g_wifiConnected = false;
 bool g_apMode = false;
@@ -250,6 +345,260 @@ void addLog(const char* msg) {
 }
 
 /*******************************************************************************
+ * EVENT LOG — PERSISTENT (FFat) + SYSLOG MIRROR
+ ******************************************************************************/
+
+// True once NTP has given us a plausible wall clock. Until then, timestamps
+// would be uptime seconds, which are worthless in a permanent record.
+bool timeIsSynced() {
+  time_t now = time(nullptr);
+  return now > NTP_SYNC_EPOCH;
+}
+
+// Mount only — NEVER format here.
+//
+// A format of the 9.875MB ffat partition blocks long enough to starve the idle
+// task and trip the task watchdog, which panics and reboots. Doing that at boot
+// produced an unrecoverable loop: reboot, format, panic, repeat, never reaching
+// WiFi and therefore never reachable by OTA. Formatting is now an explicit,
+// user-triggered action performed from loop() with the watchdog disabled, and
+// this function is called AFTER the network is up so a filesystem problem can
+// never cost us the ability to push new firmware.
+void initEventLog() {
+  g_ffatMounted = FFat.begin(false);
+  if (!g_ffatMounted) {
+    addLog("FFat not mounted — event log needs formatting (see /events)");
+    Serial.println("FFat mount failed — partition likely unformatted");
+    return;
+  }
+  Serial.printf("FFat mounted: %lu bytes total, %lu free\n",
+                (unsigned long)FFat.totalBytes(), (unsigned long)FFat.freeBytes());
+  // Events captured before the filesystem was available can now be written
+  flushPendingEvents();
+}
+
+// Quick format (no full wipe) of the ffat partition. Called only from loop(),
+// never from setup() or an async web handler, with the watchdogs disabled for
+// the duration. Still takes a few seconds and blocks the display.
+void performEventLogFormat() {
+  addLog("Formatting FFat partition...");
+  Serial.println("Formatting FFat...");
+
+  disableLoopWDT();
+  disableCore0WDT();
+  bool ok = FFat.format(false);   // false = quick format, not a full wipe
+  enableCore0WDT();
+  enableLoopWDT();
+
+  if (!ok) {
+    addLog("FFat format FAILED");
+    g_ffatMounted = false;
+    return;
+  }
+
+  g_ffatMounted = FFat.begin(false);
+  addLog(g_ffatMounted ? "FFat formatted and mounted" : "FFat formatted but mount failed");
+  if (g_ffatMounted) flushPendingEvents();
+}
+
+// RFC 3164 syslog over UDP. Fire-and-forget: no connection, no retry, no
+// blocking. Costs nothing when the collector is down, which is the point —
+// unlike the HA push, this must never stall loop().
+void sendSyslog(EventSeverity sev, const char* category, const char* message) {
+  if (!g_cfg.syslogEnabled || !g_wifiConnected) return;
+  if (strlen(g_cfg.syslogHost) == 0) return;
+
+  uint8_t pri = SYSLOG_FACILITY * 8 + EVENT_SYSLOG_SEVERITY[sev];
+
+  char timestamp[20] = "";
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 0)) {
+    // "Mmm dd hh:mm:ss" with a space-padded day, per RFC 3164
+    strftime(timestamp, sizeof(timestamp), "%b %e %H:%M:%S", &timeinfo);
+  }
+
+  char packet[320];
+  snprintf(packet, sizeof(packet), "<%u>%s %s %s: [%s] %s",
+           pri, timestamp, SYSLOG_APPNAME, SYSLOG_APPNAME, category, message);
+
+  if (g_syslogUdp.beginPacket(g_cfg.syslogHost, g_cfg.syslogPort)) {
+    g_syslogUdp.write((const uint8_t*)packet, strlen(packet));
+    g_syslogUdp.endPacket();
+  }
+}
+
+// Keep the log bounded: when the active file hits the cap, it becomes the
+// previous file and a fresh one starts. Two generations are retained.
+void rotateEventLogIfNeeded() {
+  if (!g_ffatMounted) return;
+
+  fs::File f = FFat.open(EVENT_LOG_PATH, FILE_READ);
+  if (!f) return;
+  size_t sz = f.size();
+  f.close();
+
+  if (sz < EVENT_LOG_MAX_BYTES) return;
+
+  if (FFat.exists(EVENT_LOG_PREV_PATH)) FFat.remove(EVENT_LOG_PREV_PATH);
+  FFat.rename(EVENT_LOG_PATH, EVENT_LOG_PREV_PATH);
+  addLog("Event log rotated");
+}
+
+// One JSON object per line: t=epoch, s=severity, c=category, m=message,
+// tf=tank temp if known, u=1 when the timestamp is uptime rather than wall clock.
+void writeEventLine(time_t ts, bool unsynced, EventSeverity sev,
+                    const char* category, const char* message, float tempF) {
+  if (!g_ffatMounted || !g_cfg.eventLogEnabled) return;
+
+  rotateEventLogIfNeeded();
+
+  fs::File f = FFat.open(EVENT_LOG_PATH, FILE_APPEND);
+  if (!f) {
+    Serial.println("Event log append failed");
+    return;
+  }
+
+  JsonDocument doc;
+  doc["t"] = (uint32_t)ts;
+  doc["s"] = EVENT_SEVERITY_NAME[sev];
+  doc["c"] = category;
+  doc["m"] = message;
+  if (!isnan(tempF)) doc["tf"] = roundf(tempF * 10) / 10.0;
+  if (unsynced)      doc["u"] = 1;
+
+  serializeJson(doc, f);
+  f.print('\n');
+  f.close();
+  g_eventCount++;
+}
+
+// Once NTP lands, replay events captured beforehand with reconstructed
+// timestamps derived from how long ago (in uptime) each one happened.
+void flushPendingEvents() {
+  // Needs both a wall clock to backfill from and somewhere to write to
+  if (g_pendingEventCount == 0 || !g_ffatMounted || !g_timeSynced) return;
+
+  time_t nowEpoch = time(nullptr);
+  unsigned long nowMs = millis();
+
+  for (int i = 0; i < g_pendingEventCount; i++) {
+    PendingEvent& pe = g_pendingEvents[i];
+    time_t ts = nowEpoch - (time_t)((nowMs - pe.uptimeMs) / 1000);
+    writeEventLine(ts, false, pe.severity, pe.category, pe.message, pe.tempF);
+  }
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Backfilled %d pre-NTP events", g_pendingEventCount);
+  addLog(msg);
+  g_pendingEventCount = 0;
+}
+
+// Primary entry point. Records the event to the RAM ring (for /api/log), the
+// persistent FFat log, and syslog. Safe to call before NTP sync or before FFat
+// mounts — the event is buffered and backfilled.
+void logEvent(EventSeverity sev, const char* category, const char* fmt, ...) {
+  char message[128];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(message, sizeof(message), fmt, args);
+  va_end(args);
+
+  addLog(message);
+  sendSyslog(sev, category, message);
+
+  // Anything above INFO is worth waking an automation for. Queue only — the
+  // POST is done from the HA push path.
+  if (sev >= EV_WARNING) {
+    g_haEventPending = true;
+    g_haEventSeverity = sev;
+    strlcpy(g_haEventCategory, category, sizeof(g_haEventCategory));
+    strlcpy(g_haEventMessage, message, sizeof(g_haEventMessage));
+    g_haStatusChanged = true;  // Push promptly rather than waiting for the 30s tick
+  }
+
+  float tempF = g_ds18b20Found ? g_currentTempF : NAN;
+
+  if (timeIsSynced()) {
+    if (!g_timeSynced) {
+      g_timeSynced = true;
+      flushPendingEvents();
+    }
+    if (g_ffatMounted) {
+      writeEventLine(time(nullptr), false, sev, category, message, tempF);
+      return;
+    }
+    // Synced but no filesystem yet (early boot, or awaiting format) — fall
+    // through and buffer so the event survives until storage is available.
+  }
+
+  // No wall clock or no storage yet — buffer for backfill. If the buffer fills
+  // first (WiFi down, say), write with uptime seconds and flag it as unsynced
+  // so the record is honest rather than silently wrong.
+  if (g_pendingEventCount < EVENT_PENDING_MAX) {
+    PendingEvent& pe = g_pendingEvents[g_pendingEventCount++];
+    pe.uptimeMs = millis();
+    pe.severity = sev;
+    strlcpy(pe.category, category, sizeof(pe.category));
+    strlcpy(pe.message, message, sizeof(pe.message));
+    pe.tempF = tempF;
+  } else {
+    writeEventLine((time_t)(millis() / 1000), true, sev, category, message, tempF);
+  }
+}
+
+// Stream the last `budget` bytes of a JSONL event file into a JSON array,
+// starting at a line boundary. Seeking rather than counting lines keeps memory
+// use flat regardless of how large the log has grown.
+void streamEventTail(AsyncResponseStream* res, const char* path, size_t budget, bool& first) {
+  if (!FFat.exists(path)) return;
+
+  fs::File f = FFat.open(path, FILE_READ);
+  if (!f) return;
+
+  size_t size = f.size();
+  if (size > budget) {
+    f.seek(size - budget);
+    f.readStringUntil('\n');  // Discard the partial line we landed mid-way into
+  }
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] != '{') continue;
+    if (!first) res->print(',');
+    res->print(line);
+    first = false;
+  }
+  f.close();
+}
+
+// Human-readable ESP32 reset reason for the boot event.
+const char* resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power-on";
+    case ESP_RST_EXT:      return "external";
+    case ESP_RST_SW:       return "software";      // Normal OTA / config reboot
+    case ESP_RST_PANIC:    return "PANIC";
+    case ESP_RST_INT_WDT:  return "int-watchdog";
+    case ESP_RST_TASK_WDT: return "task-watchdog";
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO:     return "sdio";
+    default:               return "unknown";
+  }
+}
+
+// Called from loop() so a late NTP sync still triggers the backfill even if no
+// new event happens to arrive after it.
+void checkTimeSync() {
+  if (g_timeSynced || !timeIsSynced()) return;
+  g_timeSynced = true;
+  addLog("NTP time synchronized");
+  flushPendingEvents();
+}
+
+/*******************************************************************************
  * CONFIGURATION — PREFERENCES
  ******************************************************************************/
 void loadConfig() {
@@ -278,6 +627,12 @@ void loadConfig() {
   g_cfg.dimStartHour       = g_prefs.getUChar("dimStart", 22);
   g_cfg.dimEndHour         = g_prefs.getUChar("dimEnd", 6);
   g_cfg.lightBaseline      = g_prefs.getUShort("lightBase", 0);
+  strlcpy(g_cfg.tzString,       g_prefs.getString("tz", DEFAULT_TZ).c_str(),          sizeof(g_cfg.tzString));
+  strlcpy(g_cfg.ntpServer,      g_prefs.getString("ntp", NTP_SERVER_1).c_str(),       sizeof(g_cfg.ntpServer));
+  g_cfg.syslogEnabled      = g_prefs.getBool("sysEn", true);
+  strlcpy(g_cfg.syslogHost,     g_prefs.getString("sysHost", DEFAULT_SYSLOG_HOST).c_str(), sizeof(g_cfg.syslogHost));
+  g_cfg.syslogPort         = g_prefs.getUShort("sysPort", DEFAULT_SYSLOG_PORT);
+  g_cfg.eventLogEnabled    = g_prefs.getBool("evtEn", true);
 
   g_prefs.end();
 }
@@ -308,6 +663,12 @@ void saveConfig() {
   g_prefs.putUChar("dimStart",  g_cfg.dimStartHour);
   g_prefs.putUChar("dimEnd",    g_cfg.dimEndHour);
   g_prefs.putUShort("lightBase", g_cfg.lightBaseline);
+  g_prefs.putString("tz",       g_cfg.tzString);
+  g_prefs.putString("ntp",      g_cfg.ntpServer);
+  g_prefs.putBool("sysEn",      g_cfg.syslogEnabled);
+  g_prefs.putString("sysHost",  g_cfg.syslogHost);
+  g_prefs.putUShort("sysPort",  g_cfg.syslogPort);
+  g_prefs.putBool("evtEn",      g_cfg.eventLogEnabled);
 
   g_prefs.end();
 }
@@ -385,11 +746,18 @@ void connectWiFi() {
   }
 
   WiFi.mode(WIFI_STA);
+  // Modem sleep is a well-known cause of repeated drop/reconnect churn on a
+  // marginal signal, which is what this device sits on (~-74 dBm at the tank).
+  // Costs a little power; we are USB-powered, so it is a clear win.
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
 
   Serial.printf("Connecting to %s", g_cfg.wifiSSID);
   unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+  // 30s, not 15s: signal at the water heater is around -70 dBm, and association
+  // there can take longer than a bench test suggests.
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 30000) {
     delay(500);
     Serial.print(".");
   }
@@ -399,20 +767,71 @@ void connectWiFi() {
     g_wifiConnected = true;
     g_apMode = false;
 
-    // Sync NTP
-    configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
+    // Sync NTP using a POSIX TZ string so DST transitions are handled by the
+    // C library rather than a hardcoded offset that is wrong half the year.
+    configTzTime(g_cfg.tzString, g_cfg.ntpServer, NTP_SERVER_2);
 
     // ArduinoOTA for command-line firmware updates
     ArduinoOTA.setHostname("waterheater");
     ArduinoOTA.begin();
 
-    char msg[80];
-    snprintf(msg, sizeof(msg), "WiFi connected: %s IP: %s", g_cfg.wifiSSID, WiFi.localIP().toString().c_str());
-    addLog(msg);
-    Serial.println(msg);
+    // Give NTP a moment to land so boot events get real timestamps rather than
+    // going through the pending-backfill path.
+    unsigned long ntpWait = millis();
+    while (!timeIsSynced() && millis() - ntpWait < 5000) delay(100);
+    if (timeIsSynced()) g_timeSynced = true;
+
+    logEvent(EV_INFO, "wifi", "WiFi connected: %s IP: %s",
+             g_cfg.wifiSSID, WiFi.localIP().toString().c_str());
   } else {
-    addLog("WiFi connection failed, starting AP");
+    logEvent(EV_WARNING, "wifi", "WiFi connection failed, starting AP");
     startAP();
+  }
+}
+
+// While stranded in AP mode, periodically re-attempt the configured network.
+// Runs AP+STA concurrently so the config portal stays reachable throughout, and
+// is fully non-blocking — a 30s blocking retry inside loop() would stall flash
+// detection and the display.
+void retryStationFromAP() {
+  if (!g_apMode || strlen(g_cfg.wifiSSID) == 0) return;
+
+  unsigned long now = millis();
+
+  if (!g_apRetryInProgress) {
+    if (now - g_lastApRetry < AP_RETRY_INTERVAL_MS) return;
+    g_lastApRetry = now;
+    g_apRetryInProgress = true;
+    g_apRetryStart = now;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
+    Serial.printf("AP mode: retrying %s\n", g_cfg.wifiSSID);
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    g_apRetryInProgress = false;
+    g_apMode = false;
+    g_wifiConnected = true;
+    g_wifiWasConnected = true;
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+
+    configTzTime(g_cfg.tzString, g_cfg.ntpServer, NTP_SERVER_2);
+    ArduinoOTA.setHostname("waterheater");
+    ArduinoOTA.begin();
+
+    logEvent(EV_INFO, "wifi", "Recovered from AP mode: %s IP: %s",
+             g_cfg.wifiSSID, WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  if (now - g_apRetryStart > AP_RETRY_TIMEOUT_MS) {
+    g_apRetryInProgress = false;
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP);
+    Serial.println("AP mode: retry failed, staying in AP");
   }
 }
 
@@ -424,6 +843,17 @@ const FlashCodeInfo* getFlashCodeInfo(int code) {
     if (FLASH_CODES[i].code == code) return &FLASH_CODES[i];
   }
   return nullptr;
+}
+
+// Translate a flash code's severity string into an event severity, so a pilot
+// outage lands in the log (and syslog) at the priority it deserves.
+EventSeverity severityForFlashCode(int code) {
+  const FlashCodeInfo* info = getFlashCodeInfo(code);
+  if (!info) return EV_WARNING;                              // Unrecognized pattern
+  if (strcmp(info->severity, "OK") == 0)       return EV_INFO;
+  if (strcmp(info->severity, "WARNING") == 0)  return EV_WARNING;
+  if (strcmp(info->severity, "CRITICAL") == 0) return EV_CRITICAL;
+  return EV_ERROR;
 }
 
 void processFlashDetection() {
@@ -511,10 +941,9 @@ void processFlashDetection() {
 
         if (prevCode != g_confirmedFlashCode) {
           const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
-          char msg[80];
-          snprintf(msg, sizeof(msg), "Flash code changed: %d (%s)", g_confirmedFlashCode,
-                   info ? info->text : "Unknown");
-          addLog(msg);
+          logEvent(severityForFlashCode(g_confirmedFlashCode), "status",
+                   "Flash code %d: %s", g_confirmedFlashCode,
+                   info ? info->text : "Unknown code");
           g_haStatusChanged = true;
         }
       } else {
@@ -556,8 +985,17 @@ void processTemperature() {
 
     float tempC = g_ds18b20.getTempC(g_ds18b20Addr);
     if (tempC == DEVICE_DISCONNECTED_C) {
-      addLog("DS18B20 read error — disconnected?");
+      // Edge-triggered: a permanently unplugged probe must not write an event
+      // every 10 seconds for as long as it stays unplugged.
+      if (!g_tempReadFailed) {
+        g_tempReadFailed = true;
+        logEvent(EV_ERROR, "sensor", "DS18B20 read failed — probe disconnected?");
+      }
       return;
+    }
+    if (g_tempReadFailed) {
+      g_tempReadFailed = false;
+      logEvent(EV_INFO, "sensor", "DS18B20 reading recovered");
     }
 
     g_currentTempC = tempC;
@@ -577,8 +1015,38 @@ void processTemperature() {
       g_lastTempGraphSample = now;
     }
 
+    // Temperature threshold crossings — logged on the edge, not per reading
+    checkTempThresholds();
+
     // Cycle detection
     detectHeatingCycle();
+  }
+}
+
+// Log only transitions across the warning/critical thresholds. Without edge
+// tracking a hot tank would write an event every 10 seconds and drown the log.
+void checkTempThresholds() {
+  if (isnan(g_currentTempF)) return;
+
+  // Small hysteresis band so a reading hovering on the line doesn't oscillate
+  const float HYST = 2.0;
+
+  if (!g_tempCritActive && g_currentTempF >= g_cfg.criticalTemp) {
+    g_tempCritActive = true;
+    logEvent(EV_CRITICAL, "temp", "Temperature CRITICAL: %.1fF (threshold %.0fF)",
+             g_currentTempF, g_cfg.criticalTemp);
+  } else if (g_tempCritActive && g_currentTempF < g_cfg.criticalTemp - HYST) {
+    g_tempCritActive = false;
+    logEvent(EV_INFO, "temp", "Temperature back below critical: %.1fF", g_currentTempF);
+  }
+
+  if (!g_tempWarnActive && g_currentTempF >= g_cfg.highTempWarning) {
+    g_tempWarnActive = true;
+    logEvent(EV_WARNING, "temp", "Temperature high: %.1fF (threshold %.0fF)",
+             g_currentTempF, g_cfg.highTempWarning);
+  } else if (g_tempWarnActive && g_currentTempF < g_cfg.highTempWarning - HYST) {
+    g_tempWarnActive = false;
+    logEvent(EV_INFO, "temp", "Temperature back to normal: %.1fF", g_currentTempF);
   }
 }
 
@@ -965,6 +1433,48 @@ void drawScreenHotWater() {
   g_sprite.drawString(stateText, 160, 115, 4);
   g_sprite.setTextSize(1);
 
+  // Flame icon next to "ON" when burner is firing
+  if (on && g_burnerActive) {
+    int fx = 245, fy = 115;
+    g_sprite.fillTriangle(fx, fy+32, fx-18, fy-2,  fx+18, fy-2,  TFT_ORANGE);
+    g_sprite.fillTriangle(fx, fy-32, fx-14, fy+14, fx+14, fy+14, TFT_ORANGE);
+    g_sprite.fillTriangle(fx, fy-12, fx-7,  fy+18, fx+7,  fy+18, TFT_YELLOW);
+    g_sprite.fillTriangle(fx, fy+22, fx-4,  fy+4,  fx+4,  fy+4,  TFT_YELLOW);
+  }
+
+  // WiFi signal indicator — lower left
+  {
+    const int barX = 8;
+    const int barBase = 160;
+    const int barWidth = 4;
+    const int barGap = 2;
+    const int heights[4] = {4, 8, 12, 16};
+    int rssi = g_wifiConnected ? WiFi.RSSI() : 0;
+    int level = 0;
+    if (g_wifiConnected) {
+      if      (rssi >= -55) level = 4;
+      else if (rssi >= -65) level = 3;
+      else if (rssi >= -75) level = 2;
+      else if (rssi >= -85) level = 1;
+    }
+    uint16_t color = TFT_GREEN;
+    if      (!g_wifiConnected) color = TFT_DARKGREY;
+    else if (level <= 1)       color = TFT_RED;
+    else if (level == 2)       color = TFT_YELLOW;
+    for (int i = 0; i < 4; i++) {
+      int x = barX + i * (barWidth + barGap);
+      int y = barBase - heights[i];
+      if (i < level) g_sprite.fillRect(x, y, barWidth, heights[i], color);
+      else           g_sprite.drawRect(x, y, barWidth, heights[i], TFT_DARKGREY);
+    }
+    char rssiStr[16];
+    if (g_wifiConnected) snprintf(rssiStr, sizeof(rssiStr), "%d dBm", rssi);
+    else                 snprintf(rssiStr, sizeof(rssiStr), "no wifi");
+    g_sprite.setTextDatum(BL_DATUM);
+    g_sprite.setTextColor(color, TFT_BLACK);
+    g_sprite.drawString(rssiStr, barX + 4 * (barWidth + barGap) + 4, barBase, 2);
+  }
+
   g_sprite.pushSprite(0, 0);
 }
 
@@ -1130,6 +1640,50 @@ void pushToHomeAssistant() {
     snprintf(valBuf, sizeof(valBuf), "%lu", ts / 60);
     pushHAEntity("sensor", "daily_heat_time", valBuf, "min");
   }
+
+  if (g_haEventPending) {
+    g_haEventPending = false;
+    pushHAEvent();
+  }
+}
+
+// Fire a Home Assistant event so automations can trigger on the occurrence
+// itself rather than polling entity state. Fires for WARNING and above only.
+//
+// HA automation trigger:
+//   trigger:
+//     - platform: event
+//       event_type: water_heater_alert
+void pushHAEvent() {
+  char url[256];
+  snprintf(url, sizeof(url), "%s/api/events/water_heater_alert", g_cfg.haURL);
+
+  JsonDocument doc;
+  doc["severity"] = EVENT_SEVERITY_NAME[g_haEventSeverity];
+  doc["category"] = g_haEventCategory;
+  doc["message"]  = g_haEventMessage;
+  doc["flash_code"] = g_confirmedFlashCode;
+  if (!isnan(g_currentTempF)) doc["temperature_f"] = roundf(g_currentTempF * 10) / 10.0;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClient client;
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  char authHeader[300];
+  snprintf(authHeader, sizeof(authHeader), "Bearer %s", g_cfg.haToken);
+  http.addHeader("Authorization", authHeader);
+
+  int httpCode = http.POST(payload);
+  if (httpCode < 200 || httpCode >= 300) {
+    char msg[80];
+    snprintf(msg, sizeof(msg), "HA event push failed: HTTP %d", httpCode);
+    addLog(msg);  // addLog, not logEvent — a failed push must not loop back
+  }
+  http.end();
 }
 
 void pushHAEntity(const char* domain, const char* name, const char* state, const char* unit) {
@@ -1185,6 +1739,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🔥</text></svg>'>
 <title>Water Heater Monitor</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1295,6 +1850,38 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <label>Entity ID Prefix</label>
 <input type="text" name="haPrefix" value="%HA_PREFIX%">
 
+<h2>Time &amp; Timezone</h2>
+<label>POSIX Timezone String</label>
+<input type="text" name="tz" value="%TZ%" placeholder="CST6CDT,M3.2.0/2,M11.1.0/2">
+<div style="color:#8a8aa0;font-size:0.8em;margin:-8px 0 10px">Handles DST automatically. US Central: CST6CDT,M3.2.0/2,M11.1.0/2 &middot; Eastern: EST5EDT,M3.2.0/2,M11.1.0/2 &middot; Mountain: MST7MDT,M3.2.0/2,M11.1.0/2 &middot; Pacific: PST8PDT,M3.2.0/2,M11.1.0/2</div>
+<label>NTP Server</label>
+<input type="text" name="ntp" value="%NTP%" placeholder="pool.ntp.org">
+
+<h2>Event Log</h2>
+<div class="checkbox-row">
+  <input type="checkbox" name="evtEn" id="evtEn" value="1" %EVT_EN%>
+  <label for="evtEn" style="display:inline;margin:0;">Persist events to flash (FFat)</label>
+</div>
+<div class="checkbox-row">
+  <input type="checkbox" name="sysEn" id="sysEn" value="1" %SYS_EN%>
+  <label for="sysEn" style="display:inline;margin:0;">Mirror events to syslog</label>
+</div>
+<div class="row">
+  <div>
+    <label>Syslog Host</label>
+    <input type="text" name="sysHost" value="%SYS_HOST%" placeholder="netwatch.mf">
+  </div>
+  <div>
+    <label>Syslog Port (UDP)</label>
+    <input type="number" name="sysPort" value="%SYS_PORT%" min="1" max="65535">
+  </div>
+</div>
+<div style="margin-bottom:10px">
+  <button type="button" onclick="testSyslog()">Send Test Message</button>
+  <a href="/events" style="color:#00d4ff;margin-left:10px">View Event Log &rarr;</a>
+</div>
+<div id="syslogResult" style="color:#8a8aa0;font-size:0.85em;margin-bottom:10px"></div>
+
 <h2>Display Settings</h2>
 <div class="row">
   <div>
@@ -1340,6 +1927,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 </form>
 
 <div style="margin-top:16px; text-align:center;">
+  <a href="/events" class="btn btn-secondary">Event Log</a>
   <a href="/update" class="btn btn-secondary">OTA Update</a>
   <a href="/api/status" class="btn btn-secondary">API Status</a>
   <a href="/api/debug" class="btn btn-secondary">Debug</a>
@@ -1357,6 +1945,22 @@ var calibrate=function(){
       alert('Calibrated! Baseline: '+d.baseline+', Threshold: '+d.threshold);
     })
     .catch(function(){alert('Calibration failed');});
+};
+var testSyslog=function(){
+  var out=document.getElementById('syslogResult');
+  out.textContent='Sending...';
+  fetch('/api/syslog/test',{method:'POST'})
+    .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});})
+    .then(function(res){
+      if(res.ok){
+        out.innerHTML='<span style="color:#6ad06a">Sent to '+res.d.host+':'+res.d.port+
+          ' &mdash; check your collector. UDP is fire-and-forget, so delivery is not confirmed here.</span>';
+      }else{
+        out.innerHTML='<span style="color:#ff8a4d">'+(res.d.error||'Failed')+
+          ' &mdash; save settings first if you just changed them.</span>';
+      }
+    })
+    .catch(function(){out.innerHTML='<span style="color:#ff8a4d">Request failed</span>';});
 };
 var loadStatus=function(){
   fetch('/api/status')
@@ -1483,9 +2087,201 @@ const char CHARTS_JS[] PROGMEM = R"rawliteral(
 })();
 )rawliteral";
 
+/*******************************************************************************
+ * EVENT LOG PAGE
+ *
+ * Served WITHOUT templateProcessor — its JS uses % for modulo and CSS widths,
+ * which the ESPAsyncWebServer template processor would strip. All data comes
+ * from /api/events at runtime.
+ ******************************************************************************/
+const char EVENTS_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🔥</text></svg>'>
+<title>Event Log — Water Heater Monitor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #1a1a2e; color: #e0e0e0; padding: 20px; max-width: 900px; margin: 0 auto; }
+  h1 { color: #00d4ff; font-size: 1.4em; margin-bottom: 4px; }
+  .sub { color: #8a8aa0; font-size: 0.85em; margin-bottom: 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  select, button, a.btn {
+    background: #24243e; color: #e0e0e0; border: 1px solid #3a3a5a;
+    border-radius: 6px; padding: 7px 12px; font-size: 0.9em; cursor: pointer;
+    text-decoration: none; display: inline-block; }
+  button:hover, a.btn:hover { background: #2e2e50; }
+  button.danger { border-color: #6a2a2a; color: #ff9090; }
+  .spacer { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+  th { text-align: left; color: #8a8aa0; font-weight: 600; padding: 8px 6px;
+       border-bottom: 1px solid #3a3a5a; font-size: 0.82em; text-transform: uppercase; }
+  td { padding: 8px 6px; border-bottom: 1px solid #24243e; vertical-align: top; }
+  tr:hover td { background: #20203a; }
+  .time { white-space: nowrap; color: #b0b0c8; font-variant-numeric: tabular-nums; }
+  .sev { font-weight: 700; font-size: 0.78em; letter-spacing: 0.5px; white-space: nowrap; }
+  .sev-INFO { color: #6ad06a; }
+  .sev-WARNING { color: #ffd24d; }
+  .sev-ERROR { color: #ff8a4d; }
+  .sev-CRITICAL { color: #ff5a5a; }
+  .cat { color: #7aa8d0; font-size: 0.85em; white-space: nowrap; }
+  .temp { color: #8a8aa0; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .unsynced { color: #ffd24d; font-size: 0.75em; }
+  .empty { color: #8a8aa0; padding: 30px 0; text-align: center; }
+  footer { margin-top: 20px; color: #8a8aa0; font-size: 0.8em; }
+  footer a { color: #00d4ff; }
+</style>
+</head>
+<body>
+<h1>Event Log</h1>
+<div class="sub" id="meta">Loading...</div>
+
+<div id="fmtBox" style="display:none;background:#3a2a1a;border:1px solid #6a4a2a;border-radius:8px;padding:12px;margin-bottom:14px">
+  <strong style="color:#ffd24d">Storage not initialized</strong>
+  <div style="color:#c8c8d8;font-size:0.87em;margin:6px 0 10px">
+    The flash partition is unformatted, so events are held in RAM only and lost on reboot.
+    Syslog delivery is unaffected. Formatting takes a few seconds, during which the
+    display freezes and the device stops responding &mdash; this is expected.
+  </div>
+  <button onclick="formatFs()">Format Storage</button>
+</div>
+
+<div class="bar">
+  <select id="sevFilter">
+    <option value="">All severities</option>
+    <option value="WARNING">Warning and above</option>
+    <option value="ERROR">Error and above</option>
+    <option value="CRITICAL">Critical only</option>
+  </select>
+  <select id="catFilter"><option value="">All categories</option></select>
+  <select id="limitSel">
+    <option value="50">Last 50</option>
+    <option value="100">Last 100</option>
+    <option value="200">Last 200</option>
+  </select>
+  <button onclick="load()">Refresh</button>
+  <span class="spacer"></span>
+  <a class="btn" href="/api/events/download">Download</a>
+  <button class="danger" onclick="clearLog()">Clear</button>
+  <a class="btn" href="/">Settings</a>
+</div>
+
+<table>
+  <thead><tr><th>Time</th><th>Severity</th><th>Category</th><th>Message</th><th>Temp</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div class="empty" id="empty" style="display:none">No events recorded yet.</div>
+
+<footer>Persistent event log on FFat, mirrored to syslog. <a href="/">Back to settings</a></footer>
+
+<script>
+var RANK = { INFO: 0, WARNING: 1, ERROR: 2, CRITICAL: 3 };
+var cats = {};
+
+function pad(n) { return n < 10 ? '0' + n : '' + n; }
+
+function fmtTime(ev) {
+  if (ev.u) return 'uptime +' + ev.t + 's';
+  var d = new Date(ev.t * 1000);
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+         ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function render(events) {
+  var minRank = RANK[document.getElementById('sevFilter').value];
+  if (minRank === undefined) minRank = 0;
+  var cat = document.getElementById('catFilter').value;
+
+  var shown = events.filter(function (ev) {
+    if ((RANK[ev.s] || 0) < minRank) return false;
+    if (cat && ev.c !== cat) return false;
+    return true;
+  });
+
+  var html = shown.map(function (ev) {
+    var temp = (ev.tf === undefined) ? '' : ev.tf.toFixed(1) + '&deg;F';
+    var flag = ev.u ? ' <span class="unsynced">(no NTP)</span>' : '';
+    return '<tr>' +
+      '<td class="time">' + fmtTime(ev) + flag + '</td>' +
+      '<td class="sev sev-' + esc(ev.s) + '">' + esc(ev.s) + '</td>' +
+      '<td class="cat">' + esc(ev.c) + '</td>' +
+      '<td>' + esc(ev.m) + '</td>' +
+      '<td class="temp">' + temp + '</td>' +
+      '</tr>';
+  }).join('');
+
+  document.getElementById('rows').innerHTML = html;
+  document.getElementById('empty').style.display = shown.length ? 'none' : 'block';
+}
+
+var lastEvents = [];
+
+function load() {
+  var limit = document.getElementById('limitSel').value;
+  fetch('/api/events?limit=' + limit)
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      // Newest first for reading; the file is written oldest-first
+      lastEvents = (d.events || []).slice().reverse();
+
+      lastEvents.forEach(function (ev) {
+        if (ev.c && !cats[ev.c]) {
+          cats[ev.c] = true;
+          var o = document.createElement('option');
+          o.value = ev.c; o.textContent = ev.c;
+          document.getElementById('catFilter').appendChild(o);
+        }
+      });
+
+      var parts = [lastEvents.length + ' events shown'];
+      if (!d.synced) parts.push('clock not yet synced');
+      if (d.pending) parts.push(d.pending + ' buffered in RAM');
+      document.getElementById('meta').textContent = parts.join(' · ');
+
+      // Storage unavailable is actionable, not just informational
+      document.getElementById('fmtBox').style.display = d.mounted ? 'none' : 'block';
+
+      render(lastEvents);
+    })
+    .catch(function () {
+      document.getElementById('meta').textContent = 'Failed to load events';
+    });
+}
+
+function clearLog() {
+  if (!confirm('Permanently delete the entire event log?')) return;
+  fetch('/api/events/clear', { method: 'POST' }).then(load);
+}
+
+function formatFs() {
+  if (!confirm('Format the flash storage partition? Takes a few seconds.')) return;
+  document.getElementById('meta').textContent = 'Formatting — the device will be unresponsive briefly...';
+  fetch('/api/events/format', { method: 'POST' })
+    .then(function () { setTimeout(load, 8000); })
+    .catch(function () { setTimeout(load, 8000); });
+}
+
+document.getElementById('sevFilter').onchange = function () { render(lastEvents); };
+document.getElementById('catFilter').onchange = function () { render(lastEvents); };
+document.getElementById('limitSel').onchange = load;
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
+)rawliteral";
+
 String templateProcessor(const String& var) {
   if (var == "WIFI_SSID")    return g_cfg.wifiSSID;
-  if (var == "WIFI_PASS")    return g_cfg.wifiPassword;
+  if (var == "WIFI_PASS")    return strlen(g_cfg.wifiPassword) ? SECRET_SENTINEL : "";
   if (var == "LIGHT_THRESH") return String(g_cfg.lightThreshold);
   if (var == "LIGHT_BASE")   return String(g_cfg.lightBaseline);
   if (var == "LG1") return g_cfg.lightGain == 1 ? "selected" : "";
@@ -1499,8 +2295,14 @@ String templateProcessor(const String& var) {
   if (var == "CRIT_TEMP")    return String(g_cfg.criticalTemp, 0);
   if (var == "HA_EN")        return g_cfg.haEnabled ? "checked" : "";
   if (var == "HA_URL")       return g_cfg.haURL;
-  if (var == "HA_TOKEN")     return g_cfg.haToken;
+  if (var == "HA_TOKEN")     return strlen(g_cfg.haToken) ? SECRET_SENTINEL : "";
   if (var == "HA_PREFIX")    return g_cfg.haEntityPrefix;
+  if (var == "TZ")           return g_cfg.tzString;
+  if (var == "NTP")          return g_cfg.ntpServer;
+  if (var == "EVT_EN")       return g_cfg.eventLogEnabled ? "checked" : "";
+  if (var == "SYS_EN")       return g_cfg.syslogEnabled ? "checked" : "";
+  if (var == "SYS_HOST")     return g_cfg.syslogHost;
+  if (var == "SYS_PORT")     return String(g_cfg.syslogPort);
   if (var == "SCR_ROT")      return String(g_cfg.screenRotationSec);
   if (var == "BRIGHT")       return String(g_cfg.brightness);
   if (var == "SE0") return g_cfg.screensEnabled[0] ? "checked" : "";
@@ -1528,8 +2330,11 @@ void setupWebServer() {
   g_server.on("/config", HTTP_POST, [](AsyncWebServerRequest* request) {
     if (request->hasParam("wifiSSID", true))
       strlcpy(g_cfg.wifiSSID, request->getParam("wifiSSID", true)->value().c_str(), sizeof(g_cfg.wifiSSID));
-    if (request->hasParam("wifiPass", true))
-      strlcpy(g_cfg.wifiPassword, request->getParam("wifiPass", true)->value().c_str(), sizeof(g_cfg.wifiPassword));
+    if (request->hasParam("wifiPass", true)) {
+      String v = request->getParam("wifiPass", true)->value();
+      if (v != SECRET_SENTINEL)
+        strlcpy(g_cfg.wifiPassword, v.c_str(), sizeof(g_cfg.wifiPassword));
+    }
     if (request->hasParam("lightThresh", true))
       g_cfg.lightThreshold = request->getParam("lightThresh", true)->value().toInt();
     if (request->hasParam("lightGain", true))
@@ -1545,10 +2350,23 @@ void setupWebServer() {
     g_cfg.haEnabled = request->hasParam("haEnabled", true);
     if (request->hasParam("haURL", true))
       strlcpy(g_cfg.haURL, request->getParam("haURL", true)->value().c_str(), sizeof(g_cfg.haURL));
-    if (request->hasParam("haToken", true))
-      strlcpy(g_cfg.haToken, request->getParam("haToken", true)->value().c_str(), sizeof(g_cfg.haToken));
+    if (request->hasParam("haToken", true)) {
+      String v = request->getParam("haToken", true)->value();
+      if (v != SECRET_SENTINEL)
+        strlcpy(g_cfg.haToken, v.c_str(), sizeof(g_cfg.haToken));
+    }
     if (request->hasParam("haPrefix", true))
       strlcpy(g_cfg.haEntityPrefix, request->getParam("haPrefix", true)->value().c_str(), sizeof(g_cfg.haEntityPrefix));
+    if (request->hasParam("tz", true))
+      strlcpy(g_cfg.tzString, request->getParam("tz", true)->value().c_str(), sizeof(g_cfg.tzString));
+    if (request->hasParam("ntp", true))
+      strlcpy(g_cfg.ntpServer, request->getParam("ntp", true)->value().c_str(), sizeof(g_cfg.ntpServer));
+    g_cfg.eventLogEnabled = request->hasParam("evtEn", true);
+    g_cfg.syslogEnabled   = request->hasParam("sysEn", true);
+    if (request->hasParam("sysHost", true))
+      strlcpy(g_cfg.syslogHost, request->getParam("sysHost", true)->value().c_str(), sizeof(g_cfg.syslogHost));
+    if (request->hasParam("sysPort", true))
+      g_cfg.syslogPort = request->getParam("sysPort", true)->value().toInt();
     if (request->hasParam("scrRotSec", true))
       g_cfg.screenRotationSec = request->getParam("scrRotSec", true)->value().toInt();
     g_cfg.screensEnabled[0] = request->hasParam("scrEn0", true);
@@ -1663,6 +2481,39 @@ void setupWebServer() {
 
     doc["wifi_ssid"] = g_wifiConnected ? WiFi.SSID() : "N/A";
     doc["wifi_rssi"] = g_wifiConnected ? WiFi.RSSI() : 0;
+
+    // Event log / time diagnostics
+    JsonObject ev = doc["event_log"].to<JsonObject>();
+    ev["ffat_mounted"] = g_ffatMounted;
+    ev["enabled"] = g_cfg.eventLogEnabled;
+    ev["written_this_boot"] = g_eventCount;
+    ev["pending_ntp_backfill"] = g_pendingEventCount;
+    if (g_ffatMounted) {
+      ev["ffat_total_bytes"] = FFat.totalBytes();
+      ev["ffat_free_bytes"] = FFat.freeBytes();
+      fs::File f = FFat.open(EVENT_LOG_PATH, FILE_READ);
+      ev["log_bytes"] = f ? f.size() : 0;
+      if (f) f.close();
+      ev["rotated_file_exists"] = FFat.exists(EVENT_LOG_PREV_PATH);
+    }
+
+    JsonObject sl = doc["syslog"].to<JsonObject>();
+    sl["enabled"] = g_cfg.syslogEnabled;
+    sl["host"] = g_cfg.syslogHost;
+    sl["port"] = g_cfg.syslogPort;
+
+    JsonObject tm = doc["time"].to<JsonObject>();
+    tm["tz"] = g_cfg.tzString;
+    tm["ntp_server"] = g_cfg.ntpServer;
+    tm["synced"] = g_timeSynced;
+    tm["epoch"] = (uint32_t)time(nullptr);
+    {
+      struct tm ti;
+      char buf[32] = "unsynced";
+      if (getLocalTime(&ti, 0)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+      tm["local"] = buf;
+    }
+    tm["reset_reason"] = resetReasonText();
     doc["wifi_ip"] = g_wifiConnected ? WiFi.localIP().toString() : (g_apMode ? WiFi.softAPIP().toString() : "N/A");
     doc["wifi_mac"] = WiFi.macAddress();
     doc["ap_mode"] = g_apMode;
@@ -1710,6 +2561,105 @@ void setupWebServer() {
       entry["message"] = g_log[idx].message;
     }
 
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // Events page (separate PROGMEM, served WITHOUT templateProcessor — its JS
+  // uses % for modulo and CSS widths, which the template processor would eat)
+  g_server.on("/events", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", EVENTS_HTML);
+  });
+
+  // NOTE: /api/events/* GET routes MUST be registered before /api/events.
+  // ESPAsyncWebServer matches a handler when the request URL merely starts with
+  // the registered path, so /api/events would otherwise swallow its own
+  // subpaths. (The POST subroutes are safe by method, but keep them together.)
+
+  // API: Raw event log download, for archiving off the device
+  g_server.on("/api/events/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!g_ffatMounted || !FFat.exists(EVENT_LOG_PATH)) {
+      request->send(404, "application/json", "{\"error\":\"no event log\"}");
+      return;
+    }
+    AsyncWebServerResponse* res = request->beginResponse(FFat, EVENT_LOG_PATH, "application/x-ndjson");
+    res->addHeader("Content-Disposition", "attachment; filename=\"events.jsonl\"");
+    request->send(res);
+  });
+
+  // API: Persistent event log (newest last). `limit` is approximate — we seek
+  // back a byte window rather than counting lines, to keep RAM bounded.
+  g_server.on("/api/events", HTTP_GET, [](AsyncWebServerRequest* request) {
+    int limit = 50;
+    if (request->hasParam("limit")) limit = request->getParam("limit")->value().toInt();
+    if (limit < 1)   limit = 1;
+    if (limit > 200) limit = 200;
+
+    AsyncResponseStream* res = request->beginResponseStream("application/json");
+    res->printf("{\"mounted\":%s,\"synced\":%s,\"written\":%lu,\"pending\":%d,\"events\":[",
+                g_ffatMounted ? "true" : "false",
+                g_timeSynced ? "true" : "false",
+                (unsigned long)g_eventCount, g_pendingEventCount);
+
+    size_t budget = (size_t)limit * EVENT_READ_BYTES;
+    bool first = true;
+
+    // Pull from the rotated file first only if the active one is short on data
+    size_t activeSize = 0;
+    if (g_ffatMounted) {
+      fs::File a = FFat.open(EVENT_LOG_PATH, FILE_READ);
+      if (a) { activeSize = a.size(); a.close(); }
+      if (activeSize < budget && FFat.exists(EVENT_LOG_PREV_PATH)) {
+        streamEventTail(res, EVENT_LOG_PREV_PATH, budget - activeSize, first);
+      }
+      streamEventTail(res, EVENT_LOG_PATH, budget, first);
+    }
+
+    res->print("]}");
+    request->send(res);
+  });
+
+  // API: Clear the event log (both generations)
+  g_server.on("/api/events/clear", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!g_ffatMounted) {
+      request->send(500, "application/json", "{\"error\":\"FFat not mounted\"}");
+      return;
+    }
+    if (FFat.exists(EVENT_LOG_PATH))      FFat.remove(EVENT_LOG_PATH);
+    if (FFat.exists(EVENT_LOG_PREV_PATH)) FFat.remove(EVENT_LOG_PREV_PATH);
+    g_eventCount = 0;
+    request->send(200, "application/json", "{\"ok\":true}");
+    // addLog + syslog rather than logEvent: this runs in the AsyncTCP task, and
+    // writing to FFat from there while loop() may be appending is worth avoiding.
+    addLog("Event log cleared via web UI");
+    sendSyslog(EV_INFO, "system", "Event log cleared via web UI");
+  });
+
+  // API: Format the FFat partition. Explicit and user-triggered — the format
+  // itself happens in loop(), not here.
+  g_server.on("/api/events/format", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (g_ffatMounted) {
+      request->send(400, "application/json",
+                    "{\"error\":\"already mounted — clear the log instead of reformatting\"}");
+      return;
+    }
+    g_formatRequested = true;
+    request->send(200, "application/json",
+                  "{\"ok\":true,\"note\":\"formatting; the display will freeze for a few seconds\"}");
+  });
+
+  // API: Send a test syslog message, to verify the collector is receiving
+  g_server.on("/api/syslog/test", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!g_cfg.syslogEnabled || strlen(g_cfg.syslogHost) == 0) {
+      request->send(400, "application/json", "{\"error\":\"syslog not configured\"}");
+      return;
+    }
+    sendSyslog(EV_INFO, "test", "Syslog test message from water heater monitor");
+    JsonDocument doc;
+    doc["sent"] = true;
+    doc["host"] = g_cfg.syslogHost;
+    doc["port"] = g_cfg.syslogPort;
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);
@@ -1801,6 +2751,12 @@ void setup() {
   loadConfig();
   addLog("Config loaded from flash");
 
+  // Apply the timezone immediately so any pre-WiFi timestamp formatting is
+  // correct; configTzTime() in connectWiFi() adds the NTP servers.
+  // NOTE: the event log is mounted later, after WiFi and the web server are up.
+  setenv("TZ", g_cfg.tzString, 1);
+  tzset();
+
   // Initialize I2C for TSL2591
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
@@ -1831,18 +2787,27 @@ void setup() {
   // Start web server
   setupWebServer();
 
+  // Mount the event log only now that WiFi and OTA are live. If the filesystem
+  // is in any way unhappy, the device stays reachable and reflashable.
+  initEventLog();
+
   // Update backlight
   updateBacklight();
 
   g_lastScreenChange = millis();
 
-  char bootMsg[64];
-  snprintf(bootMsg, sizeof(bootMsg), "Boot complete. TSL:%s DS18B20:%s WiFi:%s",
+  // Boot event carries the reset reason — an unexpected reboot (panic, brownout,
+  // watchdog) is exactly the kind of thing a persistent log exists to catch.
+  logEvent(EV_INFO, "boot", "Boot: reset=%s TSL:%s DS18B20:%s WiFi:%s",
+           resetReasonText(),
            g_tslFound ? "OK" : "FAIL",
            g_ds18b20Found ? "OK" : "FAIL",
            g_wifiConnected ? "OK" : (g_apMode ? "AP" : "FAIL"));
-  addLog(bootMsg);
-  Serial.println(bootMsg);
+
+  // Sensor failures are logged separately so they are filterable as their own
+  // category rather than buried inside the boot line.
+  if (!g_tslFound)     logEvent(EV_ERROR, "sensor", "TSL2591 light sensor not detected at 0x29");
+  if (!g_ds18b20Found) logEvent(EV_ERROR, "sensor", "DS18B20 temperature probe not detected on GPIO21");
 }
 
 /*******************************************************************************
@@ -1879,15 +2844,54 @@ void loop() {
   ElegantOTA.loop();
   ArduinoOTA.handle();
 
+  // Backfill pre-NTP events once the clock lands (may be well after boot if
+  // WiFi took a while to come up)
+  checkTimeSync();
+
+  // Handle a requested filesystem format, safely outside the async handler
+  if (g_formatRequested) {
+    g_formatRequested = false;
+    performEventLogFormat();
+  }
+
+  // AP-mode fallback must not be a one-way door. Previously, once a boot-time
+  // association failed the device served its own AP forever and could only be
+  // recovered physically — fatal for an OTA-only device on a marginal signal.
+  retryStationFromAP();
+
   // WiFi reconnect check
   static unsigned long lastWiFiCheck = 0;
+  static uint8_t wifiFailStreak = 0;
   if (!g_apMode && millis() - lastWiFiCheck >= 30000) {
-    if (WiFi.status() != WL_CONNECTED) {
-      g_wifiConnected = false;
-      WiFi.reconnect();
-    } else {
-      g_wifiConnected = true;
-    }
     lastWiFiCheck = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiFailStreak = 0;
+      g_wifiConnected = true;
+    } else {
+      // Require two consecutive failures before declaring the link down.
+      // A single bad sample was previously enough to log a drop and force a
+      // reconnect, which produced the observed connect/drop/connect churn and
+      // could restart an association that was still in progress.
+      if (wifiFailStreak < 255) wifiFailStreak++;
+      if (wifiFailStreak >= 2) {
+        g_wifiConnected = false;
+        // Let the SDK's auto-reconnect work first; only force it if that has
+        // clearly failed for a while.
+        if (wifiFailStreak >= 4 && wifiFailStreak % 4 == 0) WiFi.reconnect();
+      }
+    }
+
+    // Log WiFi transitions on the edge. A drop is logged to FFat only —
+    // syslog cannot reach the collector with the network down — and the
+    // restore that follows makes the outage window visible in the log.
+    if (g_wifiWasConnected && !g_wifiConnected) {
+      g_wifiWasConnected = false;
+      logEvent(EV_WARNING, "wifi", "WiFi connection lost (RSSI was %d dBm)", WiFi.RSSI());
+    } else if (!g_wifiWasConnected && g_wifiConnected) {
+      g_wifiWasConnected = true;
+      logEvent(EV_INFO, "wifi", "WiFi reconnected: IP %s (%d dBm)",
+               WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
   }
 }
