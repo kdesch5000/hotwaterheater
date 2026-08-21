@@ -1,7 +1,13 @@
 # logcheck ignore rules for the water heater monitor
 # Install on netwatch as: /etc/logcheck/ignore.d.server/waterheater
 #
-# NOTE: only HEALTHY heartbeats (flash_code=1) are ignored. A heartbeat
-# reporting any other flash code still surfaces in the logcheck report,
-# so a pilot outage is not silenced along with the routine noise.
-^\w{3} [ :[:digit:]]{11} [._[:alnum:]-]+ waterheater: \[heartbeat\] alive flash_code=1 .*$
+# ONLY NEEDED IF you add /var/log/remote/waterheater.log to
+# /etc/logcheck/logcheck.logfiles — as of 2026-08-21 logcheck does not
+# watch that file, so heartbeats are not reaching logcheck reports at all.
+#
+# netwatch's remote logs use ISO 8601 timestamps (2026-08-21T09:25:11-05:00),
+# not the RFC 3164 format the stock logcheck rules assume.
+#
+# Only HEALTHY heartbeats (flash_code=1) are ignored, so a pilot outage is
+# never silenced along with the routine noise.
+^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2} [._[:alnum:]-]+ waterheater: \[heartbeat\] alive flash_code=1 .*$
