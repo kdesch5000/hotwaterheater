@@ -100,6 +100,33 @@
 // Alert on the ABSENCE of these on the collector side.
 #define DEFAULT_HEARTBEAT_MIN 15
 
+// Home Assistant HTTP timeouts. HTTPClient defaults to 5000ms on both connect
+// and response. Seven entities are POSTed every HA_PUSH_INTERVAL_MS, so on a
+// marginal link the defaults can block loop() for ~35s per push interval —
+// longer than the interval itself — starving flash detection, the display and
+// the link watchdog. 2s is generous for a LAN and bounds the worst case.
+#define HA_HTTP_TIMEOUT_MS 2000
+
+// Link health watchdog.
+//
+// WiFi.status() reports WL_CONNECTED whenever the station is ASSOCIATED, which
+// says nothing about whether the link can carry traffic. At the edge of range
+// the ESP32 will happily hold an association it cannot use: ARP replies (single
+// frames at the lowest rate) still get through while every TCP handshake and
+// ICMP echo fails. Observed 2026-08-26 — the device sat "connected" at -93 dBm
+// for over an hour, unreachable, with the reconnect logic never firing because
+// association never dropped.
+//
+// So health is measured by PROVEN ROUND TRIPS, not association: any successful
+// HA push or probe stamps g_lastNetOkMs. Only when nothing has succeeded for
+// LINK_OK_WINDOW_MS do we spend a probe, then escalate.
+#define LINK_CHECK_INTERVAL_MS 60000   // How often to evaluate link health
+#define LINK_OK_WINDOW_MS      180000  // A proven round trip this recent = healthy
+#define LINK_PROBE_TIMEOUT_MS  3000    // TCP connect timeout for the active probe
+#define LINK_FAIL_RECONNECT    2        // Failed probes before WiFi.reconnect()
+#define LINK_FAIL_REASSOCIATE  4        // Failed probes before a full re-associate
+#define DEFAULT_LINK_REBOOT_MIN 30      // Unreachable this long → reboot; 0 = never
+
 /*******************************************************************************
  * DATA STRUCTURES
  ******************************************************************************/
@@ -173,6 +200,9 @@ struct Config {
   uint16_t syslogPort;
   uint16_t heartbeatMin;     // Syslog heartbeat interval in minutes; 0 = off
   bool eventLogEnabled;      // Persist events to FFat
+  char probeHost[64];        // Link-health probe target; empty = derive automatically
+  uint16_t probePort;        // Probe port; 0 = derive automatically
+  uint16_t linkRebootMin;    // Minutes unreachable before rebooting; 0 = never
 };
 
 // Log entry (volatile RAM ring — diagnostics, served by /api/log)
@@ -328,6 +358,16 @@ bool g_wifiConnected = false;
 bool g_apMode = false;
 unsigned long g_bootTime = 0;
 
+// Link health. g_lastNetOkMs is the millis() of the last PROVEN round trip —
+// stamped by any successful HA push or link probe, not by association state.
+// g_linkUnreachableSince is 0 while healthy, else when reachability was lost.
+unsigned long g_lastNetOkMs = 0;
+unsigned long g_lastLinkCheck = 0;
+unsigned long g_linkUnreachableSince = 0;
+uint8_t g_linkFailCount = 0;
+uint32_t g_linkProbeFailures = 0;   // Cumulative, for /api/debug
+uint32_t g_linkReassociations = 0;  // Cumulative, for /api/debug
+
 // Home Assistant
 unsigned long g_lastHAPush = 0;
 bool g_haStatusChanged = false;
@@ -427,7 +467,7 @@ void sendSyslog(EventSeverity sev, const char* category, const char* message) {
     strftime(timestamp, sizeof(timestamp), "%b %e %H:%M:%S", &timeinfo);
   }
 
-  char packet[448];  // Headroom for the heartbeat, which is longer than an event
+  char packet[512];  // Headroom for the heartbeat, which is longer than an event
   snprintf(packet, sizeof(packet), "<%u>%s %s %s: [%s] %s",
            pri, timestamp, SYSLOG_APPNAME, SYSLOG_APPNAME, category, message);
 
@@ -464,11 +504,14 @@ void sendHeartbeat() {
   int cycles; uint32_t heatSec;
   getCyclesToday(cycles, heatSec);
 
-  // key=value so it greps and parses cleanly on the collector
-  char msg[288];
+  // key=value so it greps and parses cleanly on the collector.
+  // probe_fail/reassoc are cumulative since boot — a rising count between two
+  // heartbeats means the link is degrading even while heartbeats still arrive.
+  char msg[352];
   snprintf(msg, sizeof(msg),
            "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
-           "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s",
+           "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s "
+           "probe_fail=%lu reassoc=%lu",
            g_confirmedFlashCode,
            info ? info->text : "Unknown",
            tempStr,
@@ -478,7 +521,9 @@ void sendHeartbeat() {
            WiFi.RSSI(),
            (unsigned long)((millis() - g_bootTime) / 1000),
            (unsigned long)ESP.getFreeHeap(),
-           g_ffatMounted ? "ok" : "unmounted");
+           g_ffatMounted ? "ok" : "unmounted",
+           (unsigned long)g_linkProbeFailures,
+           (unsigned long)g_linkReassociations);
 
   // Raise severity when the heater itself is unhappy, so a collector-side rule
   // can act on a heartbeat's contents as well as its absence.
@@ -694,6 +739,9 @@ void loadConfig() {
   g_cfg.syslogPort         = g_prefs.getUShort("sysPort", DEFAULT_SYSLOG_PORT);
   g_cfg.heartbeatMin       = g_prefs.getUShort("hbMin", DEFAULT_HEARTBEAT_MIN);
   g_cfg.eventLogEnabled    = g_prefs.getBool("evtEn", true);
+  strlcpy(g_cfg.probeHost,      g_prefs.getString("probeHost", "").c_str(),      sizeof(g_cfg.probeHost));
+  g_cfg.probePort          = g_prefs.getUShort("probePort", 0);
+  g_cfg.linkRebootMin      = g_prefs.getUShort("lnkRbtMin", DEFAULT_LINK_REBOOT_MIN);
 
   g_prefs.end();
 }
@@ -731,6 +779,9 @@ void saveConfig() {
   g_prefs.putUShort("sysPort",  g_cfg.syslogPort);
   g_prefs.putUShort("hbMin",    g_cfg.heartbeatMin);
   g_prefs.putBool("evtEn",      g_cfg.eventLogEnabled);
+  g_prefs.putString("probeHost", g_cfg.probeHost);
+  g_prefs.putUShort("probePort", g_cfg.probePort);
+  g_prefs.putUShort("lnkRbtMin", g_cfg.linkRebootMin);
 
   g_prefs.end();
 }
@@ -843,6 +894,10 @@ void connectWiFi() {
     while (!timeIsSynced() && millis() - ntpWait < 5000) delay(100);
     if (timeIsSynced()) g_timeSynced = true;
 
+    // Treat a fresh association as proven-good so the watchdog starts from a
+    // clean slate rather than immediately probing.
+    noteNetworkSuccess();
+
     logEvent(EV_INFO, "wifi", "WiFi connected: %s IP: %s",
              g_cfg.wifiSSID, WiFi.localIP().toString().c_str());
   } else {
@@ -884,6 +939,7 @@ void retryStationFromAP() {
     ArduinoOTA.setHostname("waterheater");
     ArduinoOTA.begin();
 
+    noteNetworkSuccess();
     logEvent(EV_INFO, "wifi", "Recovered from AP mode: %s IP: %s",
              g_cfg.wifiSSID, WiFi.localIP().toString().c_str());
     return;
@@ -894,6 +950,140 @@ void retryStationFromAP() {
     WiFi.disconnect();
     WiFi.mode(WIFI_AP);
     Serial.println("AP mode: retry failed, staying in AP");
+  }
+}
+
+/*******************************************************************************
+ * LINK HEALTH WATCHDOG
+ *
+ * Association is not reachability — see the LINK_* defines for the failure this
+ * exists to catch. Everything here is driven by g_lastNetOkMs, which only
+ * advances on a proven round trip.
+ ******************************************************************************/
+
+// Mark the link as proven good. Called from anywhere a network operation
+// demonstrably completed a round trip.
+void noteNetworkSuccess() {
+  g_lastNetOkMs = millis();
+  g_linkFailCount = 0;
+  if (g_linkUnreachableSince != 0) {
+    g_linkUnreachableSince = 0;
+    logEvent(EV_INFO, "wifi", "Link reachable again (%d dBm)", WiFi.RSSI());
+  }
+}
+
+// Split "http://host:port/path" into host and port. Returns false if no host
+// can be extracted. Port defaults to 80 when absent.
+bool parseHostPort(const char* url, char* host, size_t hostLen, uint16_t* port) {
+  if (!url || !*url) return false;
+
+  const char* p = strstr(url, "://");
+  p = p ? p + 3 : url;
+
+  const char* end = p;
+  while (*end && *end != '/' && *end != ':') end++;
+  size_t len = end - p;
+  if (len == 0 || len >= hostLen) return false;
+
+  memcpy(host, p, len);
+  host[len] = '\0';
+
+  *port = 80;
+  if (*end == ':') *port = (uint16_t) atoi(end + 1);
+  return *port != 0;
+}
+
+// Resolve what to probe. Preference order: explicit config, then the Home
+// Assistant endpoint (the device's real dependency, so a probe failure means
+// something that actually matters is unreachable), then the syslog collector.
+bool linkProbeTarget(char* host, size_t hostLen, uint16_t* port) {
+  if (strlen(g_cfg.probeHost) > 0) {
+    strlcpy(host, g_cfg.probeHost, hostLen);
+    *port = g_cfg.probePort ? g_cfg.probePort : 80;
+    return true;
+  }
+
+  if (g_cfg.haEnabled && parseHostPort(g_cfg.haURL, host, hostLen, port)) return true;
+
+  if (g_cfg.syslogEnabled && strlen(g_cfg.syslogHost) > 0) {
+    strlcpy(host, g_cfg.syslogHost, hostLen);
+    // Syslog itself is UDP and gives no delivery signal, so probe a TCP port.
+    // Anything that completes a handshake proves the path; 22 is what the
+    // collector actually listens on here.
+    *port = g_cfg.probePort ? g_cfg.probePort : 22;
+    return true;
+  }
+
+  return false;
+}
+
+// One active reachability probe: a bounded TCP connect. A completed handshake
+// is proof of a working bidirectional path in a way that association is not.
+bool probeLinkReachable() {
+  char host[64];
+  uint16_t port;
+  if (!linkProbeTarget(host, sizeof(host), &port)) return true;  // Nothing to probe against
+
+  WiFiClient client;
+  bool ok = client.connect(host, port, LINK_PROBE_TIMEOUT_MS);
+  client.stop();
+  return ok;
+}
+
+// Evaluate link health and escalate. Runs from loop(), never from a web handler.
+void checkLinkHealth() {
+  if (g_apMode) return;
+  if (WiFi.status() != WL_CONNECTED) return;  // Association handling owns this case
+
+  unsigned long now = millis();
+  if (now - g_lastLinkCheck < LINK_CHECK_INTERVAL_MS) return;
+  g_lastLinkCheck = now;
+
+  // Ordinary traffic already proved the link recently — don't spend a probe.
+  if (g_lastNetOkMs != 0 && now - g_lastNetOkMs < LINK_OK_WINDOW_MS) return;
+
+  if (probeLinkReachable()) {
+    noteNetworkSuccess();
+    return;
+  }
+
+  g_linkProbeFailures++;
+  if (g_linkFailCount < 255) g_linkFailCount++;
+  if (g_linkUnreachableSince == 0) {
+    g_linkUnreachableSince = now;
+    // FFat only — by definition syslog cannot get out right now.
+    logEvent(EV_WARNING, "wifi",
+             "Associated but unreachable (%d dBm) — probe failed", WiFi.RSSI());
+  }
+
+  // Escalation. Each step is strictly stronger than the last.
+  if (g_linkFailCount >= LINK_FAIL_REASSOCIATE) {
+    // WiFi.reconnect() re-associates to the same BSSID, which is useless when
+    // that BSSID is the problem. A full disconnect forces a fresh scan and lets
+    // the station pick a different AP.
+    g_linkReassociations++;
+    g_linkFailCount = 0;
+    g_wifiConnected = false;
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
+    Serial.println("Link watchdog: forcing full re-association");
+  } else if (g_linkFailCount >= LINK_FAIL_RECONNECT) {
+    g_wifiConnected = false;
+    WiFi.reconnect();
+    Serial.println("Link watchdog: WiFi.reconnect()");
+  }
+
+  // Last resort. An OTA-only device that is associated-but-unreachable cannot
+  // be recovered remotely, so a reboot beats staying wedged indefinitely. Safe
+  // because setup() brings up WiFi and the web server before touching FFat.
+  if (g_cfg.linkRebootMin > 0 && g_linkUnreachableSince != 0 &&
+      now - g_linkUnreachableSince > (unsigned long) g_cfg.linkRebootMin * 60000UL) {
+    logEvent(EV_ERROR, "wifi", "Unreachable %u min — rebooting", g_cfg.linkRebootMin);
+    delay(200);  // Give the FFat write a moment to land
+    ESP.restart();
   }
 }
 
@@ -1733,6 +1923,10 @@ void pushHAEvent() {
   WiFiClient client;
   HTTPClient http;
   http.begin(client, url);
+  // Bound both phases — the defaults are 5s each, which blocks loop() for far
+  // too long once the link degrades. See HA_HTTP_TIMEOUT_MS.
+  http.setConnectTimeout(HA_HTTP_TIMEOUT_MS);
+  http.setTimeout(HA_HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
 
   char authHeader[300];
@@ -1740,6 +1934,9 @@ void pushHAEvent() {
   http.addHeader("Authorization", authHeader);
 
   int httpCode = http.POST(payload);
+  // Any HTTP status — even an error — proves a completed round trip. Only a
+  // negative code means the request never made it off the device.
+  if (httpCode > 0) noteNetworkSuccess();
   if (httpCode < 200 || httpCode >= 300) {
     char msg[80];
     snprintf(msg, sizeof(msg), "HA event push failed: HTTP %d", httpCode);
@@ -1776,6 +1973,10 @@ void pushHAEntity(const char* domain, const char* name, const char* state, const
   WiFiClient client;
   HTTPClient http;
   http.begin(client, url);
+  // Bound both phases. Seven of these run per push interval, so the 5s defaults
+  // can block loop() longer than the interval itself. See HA_HTTP_TIMEOUT_MS.
+  http.setConnectTimeout(HA_HTTP_TIMEOUT_MS);
+  http.setTimeout(HA_HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
 
   char authHeader[300];
@@ -1783,6 +1984,9 @@ void pushHAEntity(const char* domain, const char* name, const char* state, const
   http.addHeader("Authorization", authHeader);
 
   int httpCode = http.POST(payload);
+  // Any HTTP status proves the round trip completed; only a negative code means
+  // the request never left the device.
+  if (httpCode > 0) noteNetworkSuccess();
   if (httpCode < 200 || httpCode >= 300) {
     char msg[80];
     snprintf(msg, sizeof(msg), "HA push failed: %s HTTP %d", entityId, httpCode);
@@ -1946,6 +2150,22 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   <a href="/events" style="color:#00d4ff;margin-left:10px">View Event Log &rarr;</a>
 </div>
 <div id="syslogResult" style="color:#8a8aa0;font-size:0.85em;margin-bottom:10px"></div>
+
+<h2>Link Watchdog</h2>
+<div style="color:#8a8aa0;font-size:0.8em;margin:-4px 0 10px">WiFi can stay <em>associated</em> while carrying no traffic at all &mdash; at the edge of range the board holds a link it cannot use, and the normal reconnect logic never fires. This periodically proves the path with a real TCP connect and escalates when it fails.</div>
+<div class="row">
+  <div>
+    <label>Probe Host (blank = auto)</label>
+    <input type="text" name="probeHost" value="%PROBE_HOST%" placeholder="auto: HA, then syslog host">
+  </div>
+  <div>
+    <label>Probe Port (0 = auto)</label>
+    <input type="number" name="probePort" value="%PROBE_PORT%" min="0" max="65535">
+  </div>
+</div>
+<label>Reboot After Unreachable (minutes, 0 = never)</label>
+<input type="number" name="lnkRbtMin" value="%LNK_RBT%" min="0" max="1440">
+<div style="color:#8a8aa0;font-size:0.8em;margin:-8px 0 10px">Last resort. This device is OTA-only, so an associated-but-unreachable board cannot be recovered remotely &mdash; a reboot beats staying wedged.</div>
 
 <h2>Display Settings</h2>
 <div class="row">
@@ -2369,6 +2589,9 @@ String templateProcessor(const String& var) {
   if (var == "SYS_HOST")     return g_cfg.syslogHost;
   if (var == "SYS_PORT")     return String(g_cfg.syslogPort);
   if (var == "HB_MIN")       return String(g_cfg.heartbeatMin);
+  if (var == "PROBE_HOST")   return g_cfg.probeHost;
+  if (var == "PROBE_PORT")   return String(g_cfg.probePort);
+  if (var == "LNK_RBT")      return String(g_cfg.linkRebootMin);
   if (var == "SCR_ROT")      return String(g_cfg.screenRotationSec);
   if (var == "BRIGHT")       return String(g_cfg.brightness);
   if (var == "SE0") return g_cfg.screensEnabled[0] ? "checked" : "";
@@ -2435,6 +2658,12 @@ void setupWebServer() {
       g_cfg.syslogPort = request->getParam("sysPort", true)->value().toInt();
     if (request->hasParam("hbMin", true))
       g_cfg.heartbeatMin = request->getParam("hbMin", true)->value().toInt();
+    if (request->hasParam("probeHost", true))
+      strlcpy(g_cfg.probeHost, request->getParam("probeHost", true)->value().c_str(), sizeof(g_cfg.probeHost));
+    if (request->hasParam("probePort", true))
+      g_cfg.probePort = request->getParam("probePort", true)->value().toInt();
+    if (request->hasParam("lnkRbtMin", true))
+      g_cfg.linkRebootMin = request->getParam("lnkRbtMin", true)->value().toInt();
     if (request->hasParam("scrRotSec", true))
       g_cfg.screenRotationSec = request->getParam("scrRotSec", true)->value().toInt();
     g_cfg.screensEnabled[0] = request->hasParam("scrEn0", true);
@@ -2549,6 +2778,27 @@ void setupWebServer() {
 
     doc["wifi_ssid"] = g_wifiConnected ? WiFi.SSID() : "N/A";
     doc["wifi_rssi"] = g_wifiConnected ? WiFi.RSSI() : 0;
+
+    // Link health. "associated" and "reachable" are deliberately separate —
+    // the whole point of the watchdog is that the first does not imply the second.
+    JsonObject lk = doc["link"].to<JsonObject>();
+    lk["associated"] = (WiFi.status() == WL_CONNECTED);
+    lk["bssid"] = g_wifiConnected ? WiFi.BSSIDstr() : "N/A";
+    lk["reachable"] = (g_linkUnreachableSince == 0);
+    lk["sec_since_proven_ok"] = g_lastNetOkMs ? (millis() - g_lastNetOkMs) / 1000 : -1;
+    lk["unreachable_sec"] = g_linkUnreachableSince ? (millis() - g_linkUnreachableSince) / 1000 : 0;
+    lk["consecutive_probe_failures"] = g_linkFailCount;
+    lk["probe_failures_total"] = g_linkProbeFailures;
+    lk["reassociations_total"] = g_linkReassociations;
+    lk["reboot_after_min"] = g_cfg.linkRebootMin;
+    {
+      char ph[64]; uint16_t pp;
+      if (linkProbeTarget(ph, sizeof(ph), &pp)) {
+        lk["probe_target"] = String(ph) + ":" + String(pp);
+      } else {
+        lk["probe_target"] = "none";
+      }
+    }
 
     // Event log / time diagnostics
     JsonObject ev = doc["event_log"].to<JsonObject>();
@@ -2945,6 +3195,8 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       wifiFailStreak = 0;
       g_wifiConnected = true;
+      // NOTE: association only. Whether the link actually carries traffic is
+      // checkLinkHealth()'s job — see the LINK_* defines.
     } else {
       // Require two consecutive failures before declaring the link down.
       // A single bad sample was previously enough to log a drop and force a
@@ -2971,4 +3223,8 @@ void loop() {
                WiFi.localIP().toString().c_str(), WiFi.RSSI());
     }
   }
+
+  // Reachability watchdog. Runs after the association check so that a station
+  // which is merely associated — not usable — still gets caught.
+  checkLinkHealth();
 }
