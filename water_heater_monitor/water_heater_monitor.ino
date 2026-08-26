@@ -127,6 +127,27 @@
 #define LINK_FAIL_REASSOCIATE  4        // Failed probes before a full re-associate
 #define DEFAULT_LINK_REBOOT_MIN 30      // Unreachable this long → reboot; 0 = never
 
+// Preferred AP list.
+//
+// Left to itself the ESP32 joins whichever BSSID its scan likes best, which at
+// this location means it repeatedly camps on a distant AP it cannot actually
+// use. There is no "preferred AP" concept in the SDK — the only lever is
+// WiFi.begin(ssid, pass, channel, bssid), which pins to exactly one BSSID.
+//
+// So: scan, then join the highest-priority listed BSSID that is actually
+// present. Falls through to an unpinned join if none are found, unless strict
+// mode is on — an OTA-only device must never be able to strand itself because
+// the AP it was told to prefer is switched off.
+// Defaults are the 2.4GHz ILikeBeer VAPs of, in order, New.Basement.Office.AP
+// and Basement.TV.L6.Lite. 2.4GHz deliberately: range and wall penetration are
+// the entire problem at the tank, and the 5GHz VAPs on these APs (ch 108 / ch 44)
+// are far weaker there. Left unpinned the device camps on Olivia.Bedroom.L6
+// (70:a7:41:c6:21:e1) at -93 dBm, which is what prompted this.
+#define AP_PREF_COUNT       2      // Ordered preference slots
+#define AP_SCAN_TIMEOUT_MS  8000   // Give up on a scan that hangs
+#define DEFAULT_AP_PREF_1   "e4:38:83:28:7a:56"  // New.Basement.Office.AP  2.4GHz ch11
+#define DEFAULT_AP_PREF_2   "72:a7:41:96:1b:f1"  // Basement.TV.L6.Lite     2.4GHz ch11
+
 /*******************************************************************************
  * DATA STRUCTURES
  ******************************************************************************/
@@ -203,6 +224,7 @@ struct Config {
   char probeHost[64];        // Link-health probe target; empty = derive automatically
   uint16_t probePort;        // Probe port; 0 = derive automatically
   uint16_t linkRebootMin;    // Minutes unreachable before rebooting; 0 = never
+  char apPref[AP_PREF_COUNT][18];  // Preferred BSSIDs, highest priority first; "" = unused
 };
 
 // Log entry (volatile RAM ring — diagnostics, served by /api/log)
@@ -368,6 +390,10 @@ uint8_t g_linkFailCount = 0;
 uint32_t g_linkProbeFailures = 0;   // Cumulative, for /api/debug
 uint32_t g_linkReassociations = 0;  // Cumulative, for /api/debug
 
+// Which preferred-AP slot the current association used: 0-based, -1 = unpinned
+// (no preferred AP was on the air at scan time).
+int g_apPrefInUse = -1;
+
 // Home Assistant
 unsigned long g_lastHAPush = 0;
 bool g_haStatusChanged = false;
@@ -511,7 +537,7 @@ void sendHeartbeat() {
   snprintf(msg, sizeof(msg),
            "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
            "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s "
-           "probe_fail=%lu reassoc=%lu",
+           "probe_fail=%lu reassoc=%lu bssid=%s ap_pref=%d",
            g_confirmedFlashCode,
            info ? info->text : "Unknown",
            tempStr,
@@ -523,7 +549,9 @@ void sendHeartbeat() {
            (unsigned long)ESP.getFreeHeap(),
            g_ffatMounted ? "ok" : "unmounted",
            (unsigned long)g_linkProbeFailures,
-           (unsigned long)g_linkReassociations);
+           (unsigned long)g_linkReassociations,
+           WiFi.BSSIDstr().c_str(),
+           g_apPrefInUse);
 
   // Raise severity when the heater itself is unhappy, so a collector-side rule
   // can act on a heartbeat's contents as well as its absence.
@@ -742,6 +770,8 @@ void loadConfig() {
   strlcpy(g_cfg.probeHost,      g_prefs.getString("probeHost", "").c_str(),      sizeof(g_cfg.probeHost));
   g_cfg.probePort          = g_prefs.getUShort("probePort", 0);
   g_cfg.linkRebootMin      = g_prefs.getUShort("lnkRbtMin", DEFAULT_LINK_REBOOT_MIN);
+  strlcpy(g_cfg.apPref[0],      g_prefs.getString("apPref0", DEFAULT_AP_PREF_1).c_str(), sizeof(g_cfg.apPref[0]));
+  strlcpy(g_cfg.apPref[1],      g_prefs.getString("apPref1", DEFAULT_AP_PREF_2).c_str(), sizeof(g_cfg.apPref[1]));
 
   g_prefs.end();
 }
@@ -782,6 +812,8 @@ void saveConfig() {
   g_prefs.putString("probeHost", g_cfg.probeHost);
   g_prefs.putUShort("probePort", g_cfg.probePort);
   g_prefs.putUShort("lnkRbtMin", g_cfg.linkRebootMin);
+  g_prefs.putString("apPref0",  g_cfg.apPref[0]);
+  g_prefs.putString("apPref1",  g_cfg.apPref[1]);
 
   g_prefs.end();
 }
@@ -852,6 +884,84 @@ void startAP() {
   Serial.printf("AP started: %s @ %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
+// Parse "aa:bb:cc:dd:ee:ff" into 6 bytes. Returns false on anything malformed,
+// so a typo in the config degrades to "no preference" rather than a bad pin.
+bool macStrToBytes(const char* s, uint8_t* out) {
+  if (!s || strlen(s) != 17) return false;
+  int v[6];
+  if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) {
+    if (v[i] < 0 || v[i] > 255) return false;
+    out[i] = (uint8_t) v[i];
+  }
+  return true;
+}
+
+// Scan and return the index of the highest-priority preferred BSSID that is
+// actually on the air, filling in its BSSID bytes and channel. -1 = none found.
+//
+// Scanning rather than blindly pinning matters: WiFi.begin() with a BSSID that
+// is not present blocks for the full association timeout before failing, so
+// walking a preference list by trial would cost 30s per absent AP.
+int selectPreferredAP(uint8_t* bssidOut, int32_t* channelOut) {
+  bool anyConfigured = false;
+  for (int i = 0; i < AP_PREF_COUNT; i++) {
+    if (strlen(g_cfg.apPref[i]) > 0) { anyConfigured = true; break; }
+  }
+  if (!anyConfigured) return -1;
+
+  int found = WiFi.scanNetworks(false, true);  // sync, include hidden
+  if (found <= 0) {
+    WiFi.scanDelete();
+    return -1;
+  }
+
+  int bestPref = -1, bestIdx = -1;
+  for (int n = 0; n < found; n++) {
+    if (WiFi.SSID(n) != String(g_cfg.wifiSSID)) continue;
+    String bssid = WiFi.BSSIDstr(n);
+    for (int p = 0; p < AP_PREF_COUNT; p++) {
+      if (strlen(g_cfg.apPref[p]) == 0) continue;
+      if (!bssid.equalsIgnoreCase(g_cfg.apPref[p])) continue;
+      // Lower index wins; stop early once slot 0 is seen.
+      if (bestPref == -1 || p < bestPref) { bestPref = p; bestIdx = n; }
+      break;
+    }
+  }
+
+  if (bestIdx >= 0) {
+    memcpy(bssidOut, WiFi.BSSID(bestIdx), 6);
+    *channelOut = WiFi.channel(bestIdx);
+    Serial.printf("Preferred AP #%d %s ch%ld (%d dBm)\n",
+                  bestPref + 1, WiFi.BSSIDstr(bestIdx).c_str(),
+                  (long)*channelOut, WiFi.RSSI(bestIdx));
+  }
+
+  WiFi.scanDelete();
+  return bestPref;
+}
+
+// Start a station association, honouring the preferred-AP list. Used by both
+// the boot path and the watchdog's re-associate so escalation cannot undo the
+// preference — the plain WiFi.begin() fallback would re-pick the odd AP.
+void beginStation() {
+  uint8_t bssid[6];
+  int32_t channel = 0;
+  int pref = selectPreferredAP(bssid, &channel);
+
+  if (pref >= 0) {
+    g_apPrefInUse = pref;
+    WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword, channel, bssid);
+    return;
+  }
+
+  // No preferred AP on the air. Join unpinned rather than refusing — this is an
+  // OTA-only device, and a preference must never be able to strand it when the
+  // preferred APs are down.
+  g_apPrefInUse = -1;
+  WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
+}
+
 void connectWiFi() {
   if (strlen(g_cfg.wifiSSID) == 0) {
     startAP();
@@ -864,7 +974,7 @@ void connectWiFi() {
   // Costs a little power; we are USB-powered, so it is a clear win.
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
+  beginStation();
 
   Serial.printf("Connecting to %s", g_cfg.wifiSSID);
   unsigned long startAttempt = millis();
@@ -922,7 +1032,7 @@ void retryStationFromAP() {
     g_apRetryStart = now;
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(false);
-    WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
+    beginStation();
     Serial.printf("AP mode: retrying %s\n", g_cfg.wifiSSID);
     return;
   }
@@ -1068,7 +1178,7 @@ void checkLinkHealth() {
     delay(100);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
+    beginStation();
     Serial.println("Link watchdog: forcing full re-association");
   } else if (g_linkFailCount >= LINK_FAIL_RECONNECT) {
     g_wifiConnected = false;
@@ -2151,6 +2261,13 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 </div>
 <div id="syslogResult" style="color:#8a8aa0;font-size:0.85em;margin-bottom:10px"></div>
 
+<h2>Preferred APs</h2>
+<div style="color:#8a8aa0;font-size:0.8em;margin:-4px 0 10px">The ESP32 joins whichever BSSID its scan likes best, which here means it camps on a distant AP it cannot use. These are tried in order; if neither is on the air it joins unpinned rather than stranding itself. Use the <em>BSSID of the SSID on that AP</em>, not the AP's own MAC &mdash; and prefer the 2.4GHz VAP, which carries much further.</div>
+<label>1st Choice BSSID</label>
+<input type="text" name="apPref0" value="%AP_PREF0%" placeholder="e4:38:83:28:7a:56">
+<label>2nd Choice BSSID</label>
+<input type="text" name="apPref1" value="%AP_PREF1%" placeholder="72:a7:41:96:1b:f1">
+
 <h2>Link Watchdog</h2>
 <div style="color:#8a8aa0;font-size:0.8em;margin:-4px 0 10px">WiFi can stay <em>associated</em> while carrying no traffic at all &mdash; at the edge of range the board holds a link it cannot use, and the normal reconnect logic never fires. This periodically proves the path with a real TCP connect and escalates when it fails.</div>
 <div class="row">
@@ -2589,6 +2706,8 @@ String templateProcessor(const String& var) {
   if (var == "SYS_HOST")     return g_cfg.syslogHost;
   if (var == "SYS_PORT")     return String(g_cfg.syslogPort);
   if (var == "HB_MIN")       return String(g_cfg.heartbeatMin);
+  if (var == "AP_PREF0")     return g_cfg.apPref[0];
+  if (var == "AP_PREF1")     return g_cfg.apPref[1];
   if (var == "PROBE_HOST")   return g_cfg.probeHost;
   if (var == "PROBE_PORT")   return String(g_cfg.probePort);
   if (var == "LNK_RBT")      return String(g_cfg.linkRebootMin);
@@ -2658,6 +2777,10 @@ void setupWebServer() {
       g_cfg.syslogPort = request->getParam("sysPort", true)->value().toInt();
     if (request->hasParam("hbMin", true))
       g_cfg.heartbeatMin = request->getParam("hbMin", true)->value().toInt();
+    if (request->hasParam("apPref0", true))
+      strlcpy(g_cfg.apPref[0], request->getParam("apPref0", true)->value().c_str(), sizeof(g_cfg.apPref[0]));
+    if (request->hasParam("apPref1", true))
+      strlcpy(g_cfg.apPref[1], request->getParam("apPref1", true)->value().c_str(), sizeof(g_cfg.apPref[1]));
     if (request->hasParam("probeHost", true))
       strlcpy(g_cfg.probeHost, request->getParam("probeHost", true)->value().c_str(), sizeof(g_cfg.probeHost));
     if (request->hasParam("probePort", true))
@@ -2791,6 +2914,9 @@ void setupWebServer() {
     lk["probe_failures_total"] = g_linkProbeFailures;
     lk["reassociations_total"] = g_linkReassociations;
     lk["reboot_after_min"] = g_cfg.linkRebootMin;
+    lk["ap_pref_in_use"] = g_apPrefInUse;   // -1 = unpinned
+    JsonArray pref = lk["ap_pref"].to<JsonArray>();
+    for (int i = 0; i < AP_PREF_COUNT; i++) pref.add(g_cfg.apPref[i]);
     {
       char ph[64]; uint16_t pp;
       if (linkProbeTarget(ph, sizeof(ph), &pp)) {
