@@ -396,6 +396,13 @@ uint32_t g_linkReassociations = 0;  // Cumulative, for /api/debug
 // (no preferred AP was on the air at scan time).
 int g_apPrefInUse = -1;
 
+// Last STA disconnect reason code from the WiFi event handler. The SDK knows
+// precisely why an association failed — wrong PSK, no AP response, auth
+// timeout — and without capturing it every failure looks identical from the
+// outside, which is what made the 2026-08-26 outage so slow to diagnose.
+volatile uint8_t g_lastDisconnectReason = 0;
+uint32_t g_disconnectCount = 0;
+
 // Home Assistant
 unsigned long g_lastHAPush = 0;
 bool g_haStatusChanged = false;
@@ -539,7 +546,7 @@ void sendHeartbeat() {
   snprintf(msg, sizeof(msg),
            "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
            "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s "
-           "probe_fail=%lu reassoc=%lu bssid=%s ap_pref=%d",
+           "probe_fail=%lu reassoc=%lu bssid=%s ap_pref=%d disc=%lu reason=%u",
            g_confirmedFlashCode,
            info ? info->text : "Unknown",
            tempStr,
@@ -553,7 +560,9 @@ void sendHeartbeat() {
            (unsigned long)g_linkProbeFailures,
            (unsigned long)g_linkReassociations,
            WiFi.BSSIDstr().c_str(),
-           g_apPrefInUse);
+           g_apPrefInUse,
+           (unsigned long)g_disconnectCount,
+           g_lastDisconnectReason);
 
   // Raise severity when the heater itself is unhappy, so a collector-side rule
   // can act on a heartbeat's contents as well as its absence.
@@ -877,6 +886,33 @@ bool initDS18B20() {
 /*******************************************************************************
  * WIFI MANAGEMENT
  ******************************************************************************/
+// Human-readable form of the common wifi_err_reason_t codes. Only the ones that
+// actually discriminate between causes are named; the rest print numerically.
+const char* wifiReasonStr(uint8_t r) {
+  switch (r) {
+    case 1:   return "UNSPECIFIED";
+    case 2:   return "AUTH_EXPIRE";
+    case 4:   return "ASSOC_EXPIRE";
+    case 15:  return "4WAY_HANDSHAKE_TIMEOUT";  // almost always a wrong PSK
+    case 200: return "BEACON_TIMEOUT";
+    case 201: return "NO_AP_FOUND";
+    case 202: return "AUTH_FAIL";
+    case 203: return "ASSOC_FAIL";
+    case 204: return "HANDSHAKE_TIMEOUT";
+    case 205: return "CONNECTION_FAIL";
+    default:  return "";
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    g_lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    g_disconnectCount++;
+    const char* name = wifiReasonStr(g_lastDisconnectReason);
+    Serial.printf("[wifi] disconnected reason=%u %s\n", g_lastDisconnectReason, name);
+  }
+}
+
 void startAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
@@ -2931,6 +2967,9 @@ void setupWebServer() {
     lk["reassociations_total"] = g_linkReassociations;
     lk["reboot_after_min"] = g_cfg.linkRebootMin;
     lk["ap_pref_in_use"] = g_apPrefInUse;   // -1 = unpinned
+    lk["last_disconnect_reason"] = g_lastDisconnectReason;
+    lk["last_disconnect_reason_str"] = wifiReasonStr(g_lastDisconnectReason);
+    lk["disconnect_count"] = g_disconnectCount;
     JsonArray pref = lk["ap_pref"].to<JsonArray>();
     for (int i = 0; i < AP_PREF_COUNT; i++) pref.add(g_cfg.apPref[i]);
     {
@@ -3246,6 +3285,10 @@ void setup() {
   memset(g_hourlyHeatMin, 0, sizeof(g_hourlyHeatMin));
   memset(g_cycles, 0, sizeof(g_cycles));
   memset(g_log, 0, sizeof(g_log));
+
+  // Register before connecting so the first association's failure reason is
+  // captured too — that is exactly the one worth knowing.
+  WiFi.onEvent(onWiFiEvent);
 
   // Connect WiFi
   connectWiFi();
