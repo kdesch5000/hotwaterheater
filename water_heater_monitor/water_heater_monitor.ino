@@ -144,7 +144,6 @@
 // are far weaker there. Left unpinned the device camps on Olivia.Bedroom.L6
 // (70:a7:41:c6:21:e1) at -93 dBm, which is what prompted this.
 #define AP_PREF_COUNT       2      // Ordered preference slots
-#define AP_SCAN_TIMEOUT_MS  8000   // Give up on a scan that hangs
 #define DEFAULT_AP_PREF_1   "e4:38:83:28:7a:56"  // New.Basement.Office.AP  2.4GHz ch11
 #define DEFAULT_AP_PREF_2   "72:a7:41:96:1b:f1"  // Basement.TV.L6.Lite     2.4GHz ch11
 
@@ -362,6 +361,9 @@ unsigned long g_lastHeartbeat = 0;
 unsigned long g_lastApRetry = 0;
 unsigned long g_apRetryStart = 0;
 bool g_apRetryInProgress = false;
+// Flips each AP-mode retry cycle so a preferred-but-unjoinable AP cannot trap
+// the device in a loop that never tries anything else.
+bool g_apRetryUsePreferred = false;
 
 // Set by POST /api/events/format, acted on in loop(). The format must not run
 // inside the AsyncTCP handler — it blocks for seconds with the WDT disabled.
@@ -884,19 +886,6 @@ void startAP() {
   Serial.printf("AP started: %s @ %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
-// Parse "aa:bb:cc:dd:ee:ff" into 6 bytes. Returns false on anything malformed,
-// so a typo in the config degrades to "no preference" rather than a bad pin.
-bool macStrToBytes(const char* s, uint8_t* out) {
-  if (!s || strlen(s) != 17) return false;
-  int v[6];
-  if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
-  for (int i = 0; i < 6; i++) {
-    if (v[i] < 0 || v[i] > 255) return false;
-    out[i] = (uint8_t) v[i];
-  }
-  return true;
-}
-
 // Scan and return the index of the highest-priority preferred BSSID that is
 // actually on the air, filling in its BSSID bytes and channel. -1 = none found.
 //
@@ -944,10 +933,14 @@ int selectPreferredAP(uint8_t* bssidOut, int32_t* channelOut) {
 // Start a station association, honouring the preferred-AP list. Used by both
 // the boot path and the watchdog's re-associate so escalation cannot undo the
 // preference — the plain WiFi.begin() fallback would re-pick the odd AP.
-void beginStation() {
+// allowPreferred=false joins unpinned, skipping the scan entirely. Needed
+// because WiFi.begin() with an explicit BSSID will ONLY ever try that BSSID —
+// it cannot degrade to another AP — so a pinned attempt that fails must be
+// followed by an unpinned one or the device has no route back onto the network.
+void beginStation(bool allowPreferred) {
   uint8_t bssid[6];
   int32_t channel = 0;
-  int pref = selectPreferredAP(bssid, &channel);
+  int pref = allowPreferred ? selectPreferredAP(bssid, &channel) : -1;
 
   if (pref >= 0) {
     g_apPrefInUse = pref;
@@ -955,9 +948,8 @@ void beginStation() {
     return;
   }
 
-  // No preferred AP on the air. Join unpinned rather than refusing — this is an
-  // OTA-only device, and a preference must never be able to strand it when the
-  // preferred APs are down.
+  // Unpinned: either asked for, or no preferred AP was on the air. Never refuse
+  // to join — this is an OTA-only device, and a preference must not strand it.
   g_apPrefInUse = -1;
   WiFi.begin(g_cfg.wifiSSID, g_cfg.wifiPassword);
 }
@@ -974,7 +966,7 @@ void connectWiFi() {
   // Costs a little power; we are USB-powered, so it is a clear win.
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  beginStation();
+  beginStation(true);
 
   Serial.printf("Connecting to %s", g_cfg.wifiSSID);
   unsigned long startAttempt = millis();
@@ -985,6 +977,25 @@ void connectWiFi() {
     Serial.print(".");
   }
   Serial.println();
+
+  // A pinned attempt only ever tries the one BSSID, so its failure says nothing
+  // about the rest of the network. Fall back to an unpinned join before giving
+  // up to AP mode — otherwise a preferred AP that cannot be associated with
+  // (observed 2026-08-26 at -71 dBm) takes the device off the network entirely,
+  // which is strictly worse than the odd-AP behaviour the preference fixes.
+  if (WiFi.status() != WL_CONNECTED && g_apPrefInUse >= 0) {
+    Serial.println("Preferred AP did not associate — retrying unpinned");
+    addLog("Preferred AP failed to associate; falling back to unpinned");
+    WiFi.disconnect(true);
+    delay(100);
+    beginStation(false);
+    startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     g_wifiConnected = true;
@@ -1032,8 +1043,13 @@ void retryStationFromAP() {
     g_apRetryStart = now;
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(false);
-    beginStation();
-    Serial.printf("AP mode: retrying %s\n", g_cfg.wifiSSID);
+    // Alternate pinned/unpinned across retry cycles. If the preferred AP is
+    // present but unjoinable, an always-pinned retry loops forever; if it is
+    // simply absent, an always-unpinned retry never honours the preference.
+    g_apRetryUsePreferred = !g_apRetryUsePreferred;
+    beginStation(g_apRetryUsePreferred);
+    Serial.printf("AP mode: retrying %s (%s)\n", g_cfg.wifiSSID,
+                  g_apRetryUsePreferred ? "preferred" : "unpinned");
     return;
   }
 
@@ -1178,7 +1194,7 @@ void checkLinkHealth() {
     delay(100);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    beginStation();
+    beginStation(true);
     Serial.println("Link watchdog: forcing full re-association");
   } else if (g_linkFailCount >= LINK_FAIL_RECONNECT) {
     g_wifiConnected = false;
