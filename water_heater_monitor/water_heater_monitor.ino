@@ -1,3 +1,4 @@
+// v1.8.0 — 2026-10-26 — Wi-Fi CSI motion: display turns off when nobody's around (unless the heater has a fault)
 // v1.7.0 — 2026-08-20
 /*******************************************************************************
  * WATER HEATER MONITOR — ESP32 T-Display S3
@@ -29,6 +30,8 @@
 #include <FFat.h>
 #include <WiFiUdp.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
+#include "ping/ping_sock.h"
 #include <stdarg.h>
 
 /*******************************************************************************
@@ -132,6 +135,24 @@
 // scanning from channel 1 up, which parked this device on Olivia.Bedroom.L6
 // (ch 1) at -93 dBm while basement APs on ch 11 were far stronger.
 
+// Wi-Fi CSI motion sensing (ported from ~/scripts/ripple via the 7-inch
+// dashboard). People moving between the board and its AP disturb the
+// per-subcarrier amplitudes of the AP's frames; a 50 Hz ping to the gateway
+// keeps frames coming. See the MOTION section.
+#define MO_PING_MS       20      // 50 Hz traffic generator -> steady CSI
+#define MO_SC            51      // LLTF subcarriers used (idx 2..26, 38..63)
+#define MO_WIN           50      // packets in the moving-variance window
+#define MO_RING          128     // callback -> loop packet queue
+#define MO_FRAME_MS      100     // score rate
+#define MO_CALIB_MS      15000   // auto-set: quiet baseline sampling time
+#define MO_HIST          300     // 30 s of scores for the web graph
+#define MO_HOLD_MS       3000    // motion state held after the last trigger
+#define MO_MIN_PPS       10      // fewer packets/s than this = not sensing
+#define MO_AUTO_MULT     2.5f    // auto-set threshold = quiet p95 x this
+#define MO_THRESH_MIN    1.0f
+#define MO_THRESH_MAX    80.0f
+#define DEFAULT_MOTION_OFF_MIN 5 // minutes without motion before the display goes dark
+
 /*******************************************************************************
  * DATA STRUCTURES
  ******************************************************************************/
@@ -208,7 +229,16 @@ struct Config {
   char probeHost[64];        // Link-health probe target; empty = derive automatically
   uint16_t probePort;        // Probe port; 0 = derive automatically
   uint16_t linkRebootMin;    // Minutes unreachable before rebooting; 0 = never
+  uint8_t motionMode;        // 0 = display always on, 1 = off when no motion is sensed
+  uint16_t motionOffMin;     // Minutes without motion (or a button press) before display off
+  float motionThresh;        // CSI motion score threshold; 0 = auto-set at next start
+  char motionBssid[18];      // AP the threshold was set on (a different AP gets its own)
 };
+
+// One CSI frame's subcarrier amplitudes. Defined up here, not in the MOTION
+// section, because Arduino's auto-prototypes land above the first function and
+// moProcess() takes one.
+struct MoPkt { float amp[MO_SC]; };
 
 // Log entry (volatile RAM ring — diagnostics, served by /api/log)
 struct LogEntry {
@@ -318,6 +348,8 @@ int g_currentScreen = 3;  // Default to Hot Water ON/OFF screen
 unsigned long g_lastScreenChange = 0;
 unsigned long g_lastButtonPress = 0;
 bool g_manualScreenNav = false;
+bool g_screenOff = false;              // backlight off for lack of motion (see MOTION)
+unsigned long g_screenOffSince = 0;
 
 // Log buffer
 LogEntry g_log[MAX_LOG_ENTRIES];
@@ -519,11 +551,12 @@ void sendHeartbeat() {
   // key=value so it greps and parses cleanly on the collector.
   // probe_fail/reassoc are cumulative since boot — a rising count between two
   // heartbeats means the link is degrading even while heartbeats still arrive.
-  char msg[352];
+  char msg[400];
   snprintf(msg, sizeof(msg),
            "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
            "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s "
-           "probe_fail=%lu reassoc=%lu bssid=%s disc=%lu reason=%u",
+           "probe_fail=%lu reassoc=%lu bssid=%s disc=%lu reason=%u "
+           "screen=%s motion=\"%s\"",
            g_confirmedFlashCode,
            info ? info->text : "Unknown",
            tempStr,
@@ -538,7 +571,9 @@ void sendHeartbeat() {
            (unsigned long)g_linkReassociations,
            WiFi.BSSIDstr().c_str(),
            (unsigned long)g_disconnectCount,
-           g_lastDisconnectReason);
+           g_lastDisconnectReason,
+           g_screenOff ? "off" : "on",
+           motionStateName());
 
   // Raise severity when the heater itself is unhappy, so a collector-side rule
   // can act on a heartbeat's contents as well as its absence.
@@ -757,6 +792,10 @@ void loadConfig() {
   strlcpy(g_cfg.probeHost,      g_prefs.getString("probeHost", "").c_str(),      sizeof(g_cfg.probeHost));
   g_cfg.probePort          = g_prefs.getUShort("probePort", 0);
   g_cfg.linkRebootMin      = g_prefs.getUShort("lnkRbtMin", DEFAULT_LINK_REBOOT_MIN);
+  g_cfg.motionMode         = g_prefs.getUChar("moMode", 1);
+  g_cfg.motionOffMin       = g_prefs.getUShort("moOffMin", DEFAULT_MOTION_OFF_MIN);
+  g_cfg.motionThresh       = g_prefs.getFloat("moThresh", 0);
+  strlcpy(g_cfg.motionBssid,    g_prefs.getString("moBssid", "").c_str(),        sizeof(g_cfg.motionBssid));
 
   g_prefs.end();
 }
@@ -797,8 +836,31 @@ void saveConfig() {
   g_prefs.putString("probeHost", g_cfg.probeHost);
   g_prefs.putUShort("probePort", g_cfg.probePort);
   g_prefs.putUShort("lnkRbtMin", g_cfg.linkRebootMin);
+  g_prefs.putUChar("moMode",    g_cfg.motionMode);
+  g_prefs.putUShort("moOffMin", g_cfg.motionOffMin);
+  g_prefs.putFloat("moThresh",  g_cfg.motionThresh);
+  g_prefs.putString("moBssid",  g_cfg.motionBssid);
 
   g_prefs.end();
+
+  // Thresholds are also kept per AP, so a roam (or a reboot that joins a
+  // different strongest AP) returns to that AP's tuning instead of re-learning.
+  if (g_cfg.motionBssid[0] && g_cfg.motionThresh > 0) {
+    char key[16];
+    apThreshKey(g_cfg.motionBssid, key);
+    g_prefs.begin("motion", false);
+    g_prefs.putFloat(key, g_cfg.motionThresh);
+    g_prefs.end();
+  }
+}
+
+// NVS key for a per-AP motion threshold: "t" + 12 hex digits of the BSSID
+void apThreshKey(const char* bssid, char* key) {
+  int k = 0;
+  key[k++] = 't';
+  for (const char* c = bssid; *c && k < 13; c++)
+    if (isxdigit((unsigned char)*c)) key[k++] = tolower((unsigned char)*c);
+  key[k] = 0;
 }
 
 /*******************************************************************************
@@ -1848,9 +1910,277 @@ void updateDisplay() {
 }
 
 /*******************************************************************************
+ * MOTION — Wi-Fi CSI presence (ported from ~/scripts/ripple and the 7-inch
+ * dashboard's v3.1)
+ *
+ * The score is the mean per-subcarrier std of the AP's CSI amplitudes over the
+ * last ~1 s (MO_WIN packets), x100 = percent of mean amplitude. A still room
+ * scores ~8-16; above g_cfg.motionThresh = motion. updateBacklight() darkens
+ * the display after motionOffMin without motion or a button press.
+ *
+ * Fail-safe: the display stays on unless sensing is trustworthy (running, not
+ * calibrating, >= MO_MIN_PPS packets/s). HA pushes block loop() for seconds on
+ * a bad link; the ring overflows, the packet rate drops and the display simply
+ * stays on — never the other way round.
+ ******************************************************************************/
+MoPkt* g_moRing = nullptr;                // internal heap: this build has no PSRAM
+volatile uint32_t g_moHead = 0, g_moTail = 0;
+volatile uint32_t g_moDropped = 0;
+uint8_t g_moBssid[6] = {0};
+esp_ping_handle_t g_moPing = nullptr;
+bool g_moRunning = false;
+
+float (*g_moWin)[MO_SC] = nullptr;        // MO_WIN rows
+float g_moSum[MO_SC], g_moSumSq[MO_SC];
+int g_moWinIdx = 0, g_moWinFill = 0;
+
+float g_moScore = 0;
+float g_moHist[MO_HIST];                  // ring; g_moHistIdx = next slot (oldest)
+int g_moHistIdx = 0;
+bool g_moCalibrating = false;
+unsigned long g_moCalibStart = 0;         // sampling begins here (may be in the future)
+float g_moCalibSamples[MO_CALIB_MS / MO_FRAME_MS];
+int g_moCalibN = 0;
+volatile long g_moCalibRequestDelay = -1; // >= 0: start an auto-set after this many ms
+unsigned long g_moLastMotion = 0;         // millis of the last above-threshold score
+bool g_moMotion = false;
+uint32_t g_moPktsThisSec = 0, g_moPktRate = 0;
+int8_t g_moRssi = 0;
+volatile bool g_moSavePending = false;    // set from web handlers, saved by loop()
+volatile bool g_otaActive = false;        // pause sensing while ElegantOTA uploads
+
+static void moCsiCallback(void*, wifi_csi_info_t* info) {
+  if (!info || !info->buf || info->len < 128 || !g_moRing) return;
+  if (memcmp(info->mac, g_moBssid, 6) != 0) return;   // only frames from our AP
+  uint32_t head = g_moHead, next = (head + 1) % MO_RING;
+  if (next == g_moTail) { g_moDropped++; return; }
+  MoPkt& p = g_moRing[head];
+  const int8_t* b = info->buf;   // LLTF: 64 subcarriers x (imag, real)
+  int k = 0;
+  for (int sc = 2; sc <= 26; sc++, k++)  { float im = b[sc * 2], re = b[sc * 2 + 1]; p.amp[k] = sqrtf(im * im + re * re); }
+  for (int sc = 38; sc <= 63; sc++, k++) { float im = b[sc * 2], re = b[sc * 2 + 1]; p.amp[k] = sqrtf(im * im + re * re); }
+  g_moRssi = info->rx_ctrl.rssi;
+  g_moHead = next;
+}
+
+void moResetWindow() {
+  memset(g_moSum, 0, sizeof(g_moSum));
+  memset(g_moSumSq, 0, sizeof(g_moSumSq));
+  g_moWinIdx = g_moWinFill = 0;
+}
+
+// Use the threshold saved for the AP we're on, or auto-set one for it
+void moUseApThreshold() {
+  String b = WiFi.BSSIDstr();
+  if (g_cfg.motionThresh > 0 && b == g_cfg.motionBssid) return;
+  char key[16];
+  apThreshKey(b.c_str(), key);
+  g_prefs.begin("motion", true);
+  float t = g_prefs.getFloat(key, 0);
+  g_prefs.end();
+  if (t > 0) {
+    g_cfg.motionThresh = t;
+    strlcpy(g_cfg.motionBssid, b.c_str(), sizeof(g_cfg.motionBssid));
+    g_moSavePending = true;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Motion: threshold %.1f (saved for %s)", t, b.c_str());
+    addLog(msg);
+  } else {
+    g_moCalibRequestDelay = 0;
+  }
+}
+
+void motionStart() {
+  if (!g_moRing) g_moRing = (MoPkt*)malloc(sizeof(MoPkt) * MO_RING);
+  if (!g_moWin)  g_moWin = (float (*)[MO_SC])malloc(sizeof(float) * MO_SC * MO_WIN);
+  if (!g_moRing || !g_moWin) { addLog("Motion: buffer alloc failed"); return; }
+  moResetWindow();
+  g_moTail = g_moHead;
+  memcpy(g_moBssid, WiFi.BSSID(), 6);
+  wifi_csi_config_t cfg = {};
+  cfg.lltf_en = true;
+  cfg.ltf_merge_en = true;
+  esp_wifi_set_csi_config(&cfg);
+  esp_wifi_set_csi_rx_cb(moCsiCallback, nullptr);
+  esp_wifi_set_csi(true);
+  // New session every start: the gateway can differ after a re-associate
+  IPAddress gw = WiFi.gatewayIP();
+  esp_ping_config_t pc = ESP_PING_DEFAULT_CONFIG();
+  IP_ADDR4(&pc.target_addr, gw[0], gw[1], gw[2], gw[3]);
+  pc.count = ESP_PING_COUNT_INFINITE;
+  pc.interval_ms = MO_PING_MS;
+  pc.timeout_ms = 1000;
+  esp_ping_callbacks_t cbs = {};
+  if (esp_ping_new_session(&pc, &cbs, &g_moPing) == ESP_OK) esp_ping_start(g_moPing);
+  else { g_moPing = nullptr; addLog("Motion: ping session failed"); }
+  g_moRunning = true;
+  g_moLastMotion = millis();   // full off-delay before the first screen-off
+  moUseApThreshold();
+  char msg[96];
+  snprintf(msg, sizeof(msg), "Motion: sensing on %s, threshold %.1f", WiFi.BSSIDstr().c_str(), g_cfg.motionThresh);
+  addLog(msg);
+}
+
+void motionStop() {
+  if (g_moPing) { esp_ping_stop(g_moPing); esp_ping_delete_session(g_moPing); g_moPing = nullptr; }
+  esp_wifi_set_csi(false);
+  g_moRunning = false;
+  g_moCalibrating = false;
+  g_moMotion = false;
+  g_moScore = 0;
+  g_moPktRate = 0;
+}
+
+// Normalize by packet mean (cancels AGC gain jumps), update the moving variance
+void moProcess(const MoPkt& p) {
+  float mean = 0;
+  for (int k = 0; k < MO_SC; k++) mean += p.amp[k];
+  mean /= MO_SC;
+  if (mean < 0.5f) return;
+  float* slot = g_moWin[g_moWinIdx];
+  for (int k = 0; k < MO_SC; k++) {
+    float v = p.amp[k] / mean;
+    if (g_moWinFill == MO_WIN) { g_moSum[k] -= slot[k]; g_moSumSq[k] -= slot[k] * slot[k]; }
+    slot[k] = v;
+    g_moSum[k] += v; g_moSumSq[k] += v * v;
+  }
+  g_moWinIdx = (g_moWinIdx + 1) % MO_WIN;
+  if (g_moWinFill < MO_WIN) g_moWinFill++;
+  g_moPktsThisSec++;
+}
+
+float moComputeScore() {
+  if (g_moWinFill < MO_WIN / 2) return 0;
+  float acc = 0;
+  for (int k = 0; k < MO_SC; k++) {
+    float m = g_moSum[k] / g_moWinFill;
+    acc += sqrtf(max(g_moSumSq[k] / g_moWinFill - m * m, 0.0f));
+  }
+  return acc / MO_SC * 100.0f;
+}
+
+void moFinishCalibration() {
+  int n = g_moCalibN;
+  for (int i = 1; i < n; i++) {   // insertion sort, n <= 150
+    float v = g_moCalibSamples[i]; int j = i - 1;
+    while (j >= 0 && g_moCalibSamples[j] > v) { g_moCalibSamples[j + 1] = g_moCalibSamples[j]; j--; }
+    g_moCalibSamples[j + 1] = v;
+  }
+  float p95 = n ? g_moCalibSamples[(int)(n * 0.95f)] : 0;
+  g_moCalibrating = false;
+  char msg[96];
+  if (n < 50) {
+    snprintf(msg, sizeof(msg), "Motion: auto-set failed (%d samples), threshold unchanged", n);
+    addLog(msg);
+    return;
+  }
+  g_cfg.motionThresh = constrain(p95 * MO_AUTO_MULT, MO_THRESH_MIN, MO_THRESH_MAX);
+  strlcpy(g_cfg.motionBssid, WiFi.BSSIDstr().c_str(), sizeof(g_cfg.motionBssid));
+  g_moSavePending = true;
+  g_moLastMotion = millis();
+  snprintf(msg, sizeof(msg), "Motion: auto-set quiet p95 %.1f x%.1f -> threshold %.1f", p95, MO_AUTO_MULT, g_cfg.motionThresh);
+  addLog(msg);
+}
+
+// Sensing well enough to trust a "no motion" verdict
+bool motionReady() {
+  return g_moRunning && !g_moCalibrating && g_moPktRate >= MO_MIN_PPS && g_cfg.motionThresh > 0;
+}
+
+// Highest score over the last `ms`
+float motionPeak(unsigned long ms) {
+  int n = min((int)(ms / MO_FRAME_MS), MO_HIST);
+  float p = 0;
+  for (int i = 1; i <= n; i++) p = max(p, g_moHist[(g_moHistIdx - i + MO_HIST) % MO_HIST]);
+  return p;
+}
+
+// "motion" / "still" / "calibrating" / "not sensing" / "off"
+const char* motionStateName() {
+  if (g_cfg.motionMode == 0) return "off";
+  if (g_moCalibrating) return "calibrating";
+  if (!motionReady()) return "not sensing";
+  return g_moMotion ? "motion" : "still";
+}
+
+void motionTick() {
+  static unsigned long lastFrame = 0, lastSec = 0;
+  unsigned long now = millis();
+  bool want = g_cfg.motionMode != 0 && !g_apMode && !g_otaActive && WiFi.status() == WL_CONNECTED;
+  if (want && !g_moRunning) motionStart();
+  else if (!want && g_moRunning) motionStop();
+  if (g_moSavePending) { g_moSavePending = false; saveConfig(); }
+  if (!g_moRunning) return;
+
+  while (g_moTail != g_moHead) {
+    moProcess(g_moRing[g_moTail]);
+    g_moTail = (g_moTail + 1) % MO_RING;
+  }
+
+  long d = g_moCalibRequestDelay;
+  if (d >= 0) {
+    g_moCalibRequestDelay = -1;
+    g_moCalibrating = true;
+    g_moCalibStart = now + d;
+    g_moCalibN = 0;
+    g_moMotion = false;
+    addLog("Motion: auto-set threshold (keep still for 15 s)");
+  }
+
+  if (now - lastFrame >= MO_FRAME_MS) {
+    lastFrame = now;
+    g_moScore = moComputeScore();
+    g_moHist[g_moHistIdx] = g_moScore;
+    g_moHistIdx = (g_moHistIdx + 1) % MO_HIST;
+    if (g_moCalibrating) {
+      if ((long)(now - g_moCalibStart) >= 0) {
+        if (g_moWinFill == MO_WIN && g_moCalibN < (int)(MO_CALIB_MS / MO_FRAME_MS)) g_moCalibSamples[g_moCalibN++] = g_moScore;
+        if (now - g_moCalibStart >= MO_CALIB_MS) moFinishCalibration();
+      }
+    } else if (g_cfg.motionThresh > 0) {
+      if (g_moScore > g_cfg.motionThresh) g_moLastMotion = now;
+      g_moMotion = now - g_moLastMotion < MO_HOLD_MS;
+    }
+  }
+
+  if (now - lastSec >= 1000) {
+    lastSec = now;
+    g_moPktRate = g_moPktsThisSec;
+    g_moPktsThisSec = 0;
+    // Roamed or re-associated to another AP: new baseline, and that AP's
+    // threshold (or a fresh auto-set)
+    if (memcmp(g_moBssid, WiFi.BSSID(), 6) != 0) {
+      memcpy(g_moBssid, WiFi.BSSID(), 6);
+      moResetWindow();
+      char msg[64];
+      snprintf(msg, sizeof(msg), "Motion: AP changed -> %s", WiFi.BSSIDstr().c_str());
+      addLog(msg);
+      moUseApThreshold();
+    }
+  }
+}
+
+// Only Normal Operation lets the display go dark. Off/pilot out, every fault
+// code and "unknown" (no pattern confirmed yet) keep it lit so the problem is
+// visible to whoever walks up to the tank.
+bool heaterAllowsScreenOff() {
+  return g_confirmedFlashCode == 1;
+}
+
+// Why the display is being held on, for /api/motion and /api/debug
+const char* screenHoldReason() {
+  if (g_cfg.motionMode == 0)  return "motion screen-off disabled";
+  if (!heaterAllowsScreenOff()) return "heater not in normal operation";
+  if (!motionReady())         return "not sensing";
+  if (g_manualScreenNav)      return "buttons in use";
+  return "";
+}
+
+/*******************************************************************************
  * BACKLIGHT CONTROL
  ******************************************************************************/
 void updateBacklight() {
+  unsigned long now = millis();
   uint8_t targetBright = g_cfg.brightness;
 
   struct tm timeinfo;
@@ -1867,7 +2197,31 @@ void updateBacklight() {
     }
   }
 
-  analogWrite(PIN_LCD_BL, targetBright);
+  // Screen off after motionOffMin with neither motion nor a button press.
+  // "Later of" via signed difference so it survives the millis() wrap.
+  unsigned long active = (long)(g_lastButtonPress - g_moLastMotion) > 0 ? g_lastButtonPress : g_moLastMotion;
+  bool off = screenHoldReason()[0] == 0 &&
+             now - active >= (unsigned long)g_cfg.motionOffMin * 60000UL;
+  if (off != g_screenOff) {
+    g_screenOff = off;
+    char msg[96];
+    if (off) {
+      g_screenOffSince = now;
+      snprintf(msg, sizeof(msg), "Display off: no motion for %u min", g_cfg.motionOffMin);
+    } else {
+      const char* why = screenHoldReason();
+      if (!why[0]) why = (long)(g_lastButtonPress - g_screenOffSince) > 0 ? "button" : "motion";
+      snprintf(msg, sizeof(msg), "Display on after %lu min: %s", (now - g_screenOffSince) / 60000, why);
+    }
+    addLog(msg);
+  }
+  if (g_screenOff) targetBright = 0;
+
+  static int lastBright = -1;
+  if (targetBright != lastBright) {
+    analogWrite(PIN_LCD_BL, targetBright);
+    lastBright = targetBright;
+  }
 }
 
 /*******************************************************************************
@@ -1876,6 +2230,15 @@ void updateBacklight() {
 void processButtons() {
   bool btn1 = (digitalRead(PIN_BUTTON_1) == LOW);
   bool btn2 = (digitalRead(PIN_BUTTON_2) == LOW);
+
+  // A press on a dark display only wakes it — it should not also change screens
+  if (g_screenOff && ((btn1 && !g_btn1Pressed) || (btn2 && !g_btn2Pressed))) {
+    g_lastButtonPress = millis();
+    g_btn1Pressed = btn1;
+    g_btn2Pressed = btn2;
+    updateBacklight();
+    return;
+  }
 
   // Button 1: previous screen
   if (btn1 && !g_btn1Pressed) {
@@ -2242,6 +2605,38 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   <input type="checkbox" name="scrEn3" value="1" %SE3%><label style="display:inline;margin:0;">Hot Water ON/OFF Screen</label>
 </div>
 
+<h2>Motion Screen-Off</h2>
+<div style="color:#8a8aa0;font-size:0.8em;margin:-4px 0 10px">Senses people moving between the board and its Wi-Fi access point (CSI). The display turns off after the delay below with no motion or button press, and comes back on with motion, a button press, or any status other than Normal Operation &mdash; a pilot-out or fault keeps it lit.</div>
+<div class="row">
+  <div>
+    <label>Display Off Without Motion</label>
+    <select name="moMode">
+      <option value="1" %MO1%>Enabled</option>
+      <option value="0" %MO0%>Disabled (always on)</option>
+    </select>
+  </div>
+  <div>
+    <label>After (minutes)</label>
+    <input type="number" name="moOffMin" value="%MO_OFF%" min="1" max="120">
+  </div>
+</div>
+<div class="card" id="moCard">
+  <div><strong id="moState">Loading...</strong> <span id="moDetail" style="color:#8a8aa0;font-size:0.85em"></span></div>
+  <canvas id="moGraph" width="600" height="120" style="width:100&#37;;height:120px;background:#0f1730;border-radius:6px;margin:8px 0"></canvas>
+  <div class="row">
+    <div>
+      <label>Motion Threshold</label>
+      <input type="number" id="moThresh" step="0.5" min="1" max="80">
+      <div class="info">Score above this = motion (yellow line). Lower = more sensitive. Applies immediately.</div>
+    </div>
+    <div style="display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap">
+      <button type="button" class="btn btn-secondary" onclick="moSetThresh()">Set</button>
+      <button type="button" class="btn btn-secondary" onclick="moAutoSet()">Auto-Set</button>
+    </div>
+  </div>
+  <div class="info" id="moInfo">Auto-Set waits 10 s, then samples 15 s of a still room. Nobody should be near the water heater.</div>
+</div>
+
 <h2>Auto-Dim</h2>
 <div class="row">
   <div>
@@ -2318,6 +2713,52 @@ var loadStatus=function(){
 };
 loadStatus();
 setInterval(loadStatus,10000);
+
+var moEditing=false;
+var moDraw=function(m){
+  var c=document.getElementById('moGraph'),g=c.getContext('2d'),w=c.width,h=c.height;
+  g.clearRect(0,0,w,h);
+  var top=Math.max(m.thresh*1.6,10);
+  for(var i=0;i<m.hist.length;i++)top=Math.max(top,m.hist[i]);
+  if(m.thresh>0){
+    var ty=h-h*m.thresh/top;
+    g.strokeStyle='#ffd23f';g.setLineDash([6,4]);g.beginPath();g.moveTo(0,ty);g.lineTo(w,ty);g.stroke();g.setLineDash([]);
+  }
+  g.strokeStyle='#00d4ff';g.lineWidth=2;g.beginPath();
+  for(var j=0;j<m.hist.length;j++){
+    var x=w*j/Math.max(m.hist.length-1,1),y=h-h*m.hist[j]/top;
+    if(j)g.lineTo(x,y);else g.moveTo(x,y);
+  }
+  g.stroke();
+};
+var moPoll=function(){
+  fetch('/api/motion').then(function(r){return r.json();}).then(function(m){
+    var names={motion:'Motion',still:'Still',calibrating:'Auto-setting...',off:'Sensing off','not sensing':'Not sensing'};
+    var st=document.getElementById('moState');
+    st.textContent=(names[m.state]||m.state)+' \u00b7 display '+(m.screen_off?'OFF':'on');
+    st.className=m.state==='motion'?'warn':(m.state==='still'?'ok':'');
+    var d='score '+m.score.toFixed(1)+' / '+m.thresh.toFixed(1)+' \u00b7 peak 10s '+m.peak10.toFixed(1)+
+      ' \u00b7 '+m.pps+' pkt/s \u00b7 idle '+Math.floor(m.idle_sec/60)+'m'+(m.idle_sec-Math.floor(m.idle_sec/60)*60)+'s';
+    if(m.hold)d+=' \u00b7 held on: '+m.hold;
+    document.getElementById('moDetail').textContent=d;
+    if(!moEditing)document.getElementById('moThresh').value=m.thresh.toFixed(1);
+    moDraw(m);
+  }).catch(function(){document.getElementById('moState').textContent='Motion: no response';});
+};
+document.getElementById('moThresh').onfocus=function(){moEditing=true;};
+document.getElementById('moThresh').onblur=function(){moEditing=false;};
+var moSetThresh=function(){
+  var v=document.getElementById('moThresh').value;
+  fetch('/api/motion?thresh='+encodeURIComponent(v),{method:'POST'}).then(function(){moEditing=false;moPoll();});
+};
+var moAutoSet=function(){
+  fetch('/api/motion_cal?delay=10000',{method:'POST'}).then(function(){
+    document.getElementById('moInfo').textContent='Auto-set started: step away now. 10 s countdown, then 15 s of sampling.';
+    moPoll();
+  });
+};
+moPoll();
+setInterval(moPoll,1000);
 
 </script>
 <script src="/charts.js"></script>
@@ -2652,6 +3093,9 @@ String templateProcessor(const String& var) {
   if (var == "DIM_BRIGHT")   return String(g_cfg.dimBrightness);
   if (var == "DIM_START")    return String(g_cfg.dimStartHour);
   if (var == "DIM_END")      return String(g_cfg.dimEndHour);
+  if (var == "MO1") return g_cfg.motionMode ? "selected" : "";
+  if (var == "MO0") return !g_cfg.motionMode ? "selected" : "";
+  if (var == "MO_OFF")       return String(g_cfg.motionOffMin);
   return String();
 }
 
@@ -2729,6 +3173,10 @@ void setupWebServer() {
       g_cfg.dimStartHour = request->getParam("dimStart", true)->value().toInt();
     if (request->hasParam("dimEnd", true))
       g_cfg.dimEndHour = request->getParam("dimEnd", true)->value().toInt();
+    if (request->hasParam("moMode", true))
+      g_cfg.motionMode = request->getParam("moMode", true)->value().toInt() ? 1 : 0;
+    if (request->hasParam("moOffMin", true))
+      g_cfg.motionOffMin = constrain(request->getParam("moOffMin", true)->value().toInt(), 1, 120);
 
     saveConfig();
 
@@ -2774,6 +3222,8 @@ void setupWebServer() {
     doc["free_heap"] = ESP.getFreeHeap();
     doc["light_sensor_als_raw"] = g_lastLightHigh ? g_lightPeak : 0;
     doc["light_sensor_baseline"] = g_lightBaseline;
+    doc["screen_off"] = g_screenOff;
+    doc["motion_state"] = motionStateName();
 
     String json;
     serializeJson(doc, json);
@@ -2868,6 +3318,19 @@ void setupWebServer() {
       if (f) f.close();
       ev["rotated_file_exists"] = FFat.exists(EVENT_LOG_PREV_PATH);
     }
+
+    JsonObject mo = doc["motion"].to<JsonObject>();
+    mo["mode"] = g_cfg.motionMode;
+    mo["state"] = motionStateName();
+    mo["running"] = g_moRunning;
+    mo["score"] = g_moScore;
+    mo["thresh"] = g_cfg.motionThresh;
+    mo["thresh_bssid"] = g_cfg.motionBssid;
+    mo["pps"] = g_moPktRate;
+    mo["csi_rssi"] = g_moRssi;
+    mo["dropped_total"] = g_moDropped;
+    mo["screen_off"] = g_screenOff;
+    mo["hold"] = screenHoldReason();
 
     JsonObject sl = doc["syslog"].to<JsonObject>();
     sl["enabled"] = g_cfg.syslogEnabled;
@@ -3079,7 +3542,57 @@ void setupWebServer() {
     request->send(200, "application/json", json);
   });
 
-  // ElegantOTA
+  // API: Motion (live state + 30 s score history for the web graph)
+  g_server.on("/api/motion", HTTP_GET, [](AsyncWebServerRequest* request) {
+    JsonDocument doc;
+    unsigned long now = millis();
+    unsigned long active = (long)(g_lastButtonPress - g_moLastMotion) > 0 ? g_lastButtonPress : g_moLastMotion;
+    doc["mode"] = g_cfg.motionMode;
+    doc["off_min"] = g_cfg.motionOffMin;
+    doc["thresh"] = g_cfg.motionThresh;
+    doc["thresh_bssid"] = g_cfg.motionBssid;
+    doc["bssid"] = WiFi.BSSIDstr();
+    doc["state"] = motionStateName();
+    doc["score"] = g_moScore;
+    doc["peak10"] = motionPeak(10000);
+    doc["pps"] = g_moPktRate;
+    doc["rssi"] = g_moRssi;
+    doc["screen_off"] = g_screenOff;
+    doc["idle_sec"] = (now - active) / 1000;
+    doc["hold"] = screenHoldReason();
+    JsonArray hist = doc["hist"].to<JsonArray>();
+    for (int i = 0; i < MO_HIST; i += 2)   // 5 Hz is plenty for the graph
+      hist.add(roundf(g_moHist[(g_moHistIdx + i) % MO_HIST] * 10) / 10);
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // API: Motion settings — any of mode, thresh, off_min; applied live, saved by loop()
+  g_server.on("/api/motion", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("mode"))
+      g_cfg.motionMode = request->getParam("mode")->value().toInt() ? 1 : 0;
+    if (request->hasParam("off_min"))
+      g_cfg.motionOffMin = constrain(request->getParam("off_min")->value().toInt(), 1, 120);
+    if (request->hasParam("thresh")) {
+      g_cfg.motionThresh = constrain(request->getParam("thresh")->value().toFloat(), MO_THRESH_MIN, MO_THRESH_MAX);
+      strlcpy(g_cfg.motionBssid, WiFi.BSSIDstr().c_str(), sizeof(g_cfg.motionBssid));
+    }
+    g_moSavePending = true;
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // API: Motion auto-set — sample a still room after `delay` ms
+  g_server.on("/api/motion_cal", HTTP_POST, [](AsyncWebServerRequest* request) {
+    long d = request->hasParam("delay") ? request->getParam("delay")->value().toInt() : 0;
+    g_moCalibRequestDelay = constrain(d, 0L, 120000L);
+    request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // ElegantOTA. CSI + the 50 Hz ping pause during an upload so the link's
+  // airtime goes to the firmware; onEnd(true) is followed by a reboot.
+  ElegantOTA.onStart([]() { g_otaActive = true; });
+  ElegantOTA.onEnd([](bool success) { if (!success) g_otaActive = false; });
   ElegantOTA.begin(&g_server);
 
   g_server.begin();
@@ -3212,9 +3725,13 @@ void loop() {
     lastDisplayUpdate = millis();
   }
 
-  // Backlight adjustment (check every 60 seconds)
+  // Wi-Fi CSI motion sensing
+  motionTick();
+
+  // Backlight: dim hours + motion screen-off. 250 ms so a fault or a button
+  // press lights a dark display right away.
   static unsigned long lastBLCheck = 0;
-  if (millis() - lastBLCheck >= 60000) {
+  if (millis() - lastBLCheck >= 250) {
     updateBacklight();
     lastBLCheck = millis();
   }
