@@ -1,3 +1,4 @@
+// v1.9.3 — 2026-11-18 — decision logic moved to detectors.h and property-tested on the host; hourly chart survives a backwards clock step; calibration can't save a wrapped threshold
 // v1.9.1 — 2026-10-30 — keep the crash dump, GET /api/coredump
 // v1.9.0 — 2026-10-30 — no false pilot-out from sensor faults or stalled sampling; crash dump + breadcrumb in the event log; OTA rollback; many fixes
 // v1.8.0 — 2026-10-26 — Wi-Fi CSI motion: display turns off when nobody's around (unless the heater has a fault)
@@ -40,6 +41,10 @@
 #include "ping/ping_sock.h"
 #include <stdarg.h>
 
+// Pure decision logic (flash codes, heating cycles, hourly buckets) —
+// host-compiled and property-tested by tests/
+#include "detectors.h"
+
 /*******************************************************************************
  * PIN DEFINITIONS
  ******************************************************************************/
@@ -54,7 +59,7 @@
 /*******************************************************************************
  * CONFIGURATION CONSTANTS
  ******************************************************************************/
-#define FW_VERSION               "1.9.2"
+#define FW_VERSION               "1.9.3"
 #define TSL2591_ADDR             0x29
 #define TEMP_READ_INTERVAL_MS    10000   // 10 seconds
 #define TSL_CONVERT_MS           120     // ADC time for the 100 ms integration (library's wait)
@@ -66,18 +71,8 @@
 #define MAX_CYCLES               100
 #define MAX_LOG_ENTRIES           50
 #define TEMP_HISTORY_SIZE         360    // ~12 hours at 2-min intervals
-#define HOURLY_BUCKETS            48     // 48 hours of hourly data
 
-// Flash detection timing
-#define FLASH_GAP_TIMEOUT_MS     2000   // >2s gap = end of pattern
-#define PILOT_OUT_TIMEOUT_MS     10000  // >10s no flash = pilot out
-#define FLASH_DEBOUNCE_MS        200    // Minimum time between flashes
-#define FLASH_SAMPLE_GAP_MS      1500   // A longer gap between samples = not actually watching
-#define LIGHT_BLIND_UNKNOWN_MS   60000  // Light steadily above threshold this long = status unknown
-
-// Temperature cycle detection
-#define CYCLE_TEMP_RISE_THRESHOLD 2.0   // 2 degrees F rise
-#define CYCLE_DETECT_WINDOW_MS   300000 // 5 minutes
+// Flash timing, cycle detection and HOURLY_BUCKETS live in detectors.h
 
 // WiFi AP defaults
 #define AP_SSID     "WaterHeaterMonitor"
@@ -106,7 +101,15 @@
 // Syslog (RFC 3164 over UDP)
 #define SYSLOG_FACILITY   1    // user-level messages
 #define SYSLOG_APPNAME    "waterheater"
-#define DEFAULT_SYSLOG_HOST "netwatch.mf"
+// Site-specific defaults live in local_config.h, which is gitignored (copy
+// local_config.example.h). Without it the syslog host default is empty and
+// syslog stays off until set in the web UI. A saved setting always wins.
+#if __has_include("local_config.h")
+#include "local_config.h"
+#endif
+#ifndef DEFAULT_SYSLOG_HOST
+#define DEFAULT_SYSLOG_HOST ""
+#endif
 #define DEFAULT_SYSLOG_PORT 514
 
 // Heartbeat: a periodic "still alive" syslog line carrying current state.
@@ -188,14 +191,6 @@ const FlashCodeInfo FLASH_CODES[] = {
   {8, "Flame Sense Error",           "ERROR",    TFT_RED},
 };
 const int FLASH_CODE_COUNT = sizeof(FLASH_CODES) / sizeof(FLASH_CODES[0]);
-
-// Flash detection state machine
-enum FlashState {
-  FLASH_WAITING,
-  FLASH_COUNTING,
-  FLASH_PAUSE_DETECTED,
-  FLASH_CONFIRMED
-};
 
 // Heating cycle record
 struct HeatingCycle {
@@ -313,15 +308,8 @@ bool g_ds18b20Found = false;
 DeviceAddress g_ds18b20Addr;
 
 // Flash detection state
-FlashState g_flashState = FLASH_WAITING;
-int g_flashCount = 0;
-int g_pendingFlashCount = -1;
-int g_confirmedFlashCode = -1;  // -1 = unknown
-unsigned long g_lastFlashTime = 0;
+FlashDetector g_flash;                 // State machine + baseline (detectors.h)
 unsigned long g_lastLightSampleTime = 0;
-bool g_lastLightHigh = false;
-uint16_t g_lightBaseline = 0;
-uint16_t g_lightPeak = 0;
 uint16_t g_lastReading = 0;
 bool g_tslConverting = false;
 unsigned long g_tslConvertStart = 0;
@@ -329,8 +317,6 @@ uint8_t g_tslFails = 0;
 bool g_tslFault = false;               // Reads failing or settings lost: flash status is unknown
 unsigned long g_tslLastRetry = 0;
 unsigned long g_tslLastCfgCheck = 0;
-unsigned long g_lastSampleDone = 0;
-unsigned long g_lightHighSince = 0;    // 0 = not steadily above threshold
 uint8_t g_calibRemaining = 0;          // Samples left in an /api/calibrate run
 uint32_t g_calibTotal = 0;
 uint8_t g_i2cFound[8];                 // Boot scan; scanning live would fight flash detection for the bus
@@ -344,13 +330,7 @@ bool g_tempConversionPending = false;
 unsigned long g_tempConversionStart = 0;
 
 // Heating cycle detection
-bool g_burnerActive = false;
-float g_cycleStartTemp = NAN;
-unsigned long g_cycleStartTime = 0;
-float g_cyclePeakTemp = NAN;
-float g_tempHistory2Min[60];  // Last 60 readings for slope detection (10s intervals = 10 min)
-int g_tempHistIdx = 0;
-int g_tempHistCount = 0;
+CycleDetector g_cycle;        // Burner state + slope buffer (detectors.h)
 
 // Cycle history
 HeatingCycle g_cycles[MAX_CYCLES];
@@ -365,9 +345,7 @@ int g_tempGraphHead = 0;
 unsigned long g_lastTempGraphSample = 0;
 
 // Hourly heating minutes (circular, last 48h)
-float g_hourlyHeatMin[HOURLY_BUCKETS];
-int g_hourlyHead = 0;
-uint32_t g_hourlyEpochHour = 0;   // time()/3600 of the head bucket; 0 = not started
+HourlyBuckets g_hourly;           // detectors.h
 unsigned long g_lastCycleEndMs = 0;
 
 // Display state
@@ -610,7 +588,7 @@ void sendHeartbeat() {
   if (g_lastHeartbeat != 0 && now - g_lastHeartbeat < interval) return;
   g_lastHeartbeat = now;
 
-  const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
+  const FlashCodeInfo* info = getFlashCodeInfo(g_flash.confirmedCode);
 
   char tempStr[16];
   if (isnan(g_currentTempF)) strlcpy(tempStr, "n/a", sizeof(tempStr));
@@ -622,16 +600,19 @@ void sendHeartbeat() {
   // key=value so it greps and parses cleanly on the collector.
   // probe_fail/reassoc are cumulative since boot — a rising count between two
   // heartbeats means the link is degrading even while heartbeats still arrive.
-  char msg[400];
+  // gap_* (also cumulative) say how often light readings came too far apart to
+  // be sure of seeing a ~150-250 ms flash; see /api/debug "sampling".
+  char msg[512];
   snprintf(msg, sizeof(msg),
            "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
            "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s "
            "probe_fail=%lu reassoc=%lu bssid=%s disc=%lu reason=%u "
-           "screen=%s motion=\"%s\" fw=%s",
-           g_confirmedFlashCode,
+           "screen=%s motion=\"%s\" gap_max_ms=%lu gap_blind=%lu gap_blind_wait=%lu "
+           "gap_blind_ms=%lu fw=%s",
+           g_flash.confirmedCode,
            info ? info->text : "Unknown",
            tempStr,
-           g_burnerActive ? "on" : "off",
+           g_cycle.burnerActive ? "on" : "off",
            cycles,
            (unsigned long)(heatSec / 60),
            WiFi.RSSI(),
@@ -645,12 +626,16 @@ void sendHeartbeat() {
            g_lastDisconnectReason,
            g_screenOff ? "off" : "on",
            motionStateName(),
+           (unsigned long)g_flash.gaps.maxMs,
+           (unsigned long)gapBlindCount(g_flash.gaps),
+           (unsigned long)g_flash.gaps.blindWaiting,
+           (unsigned long)g_flash.gaps.blindMs,
            FW_VERSION);
 
   // Raise severity when the heater itself is unhappy, so a collector-side rule
   // can act on a heartbeat's contents as well as its absence.
-  EventSeverity sev = (g_confirmedFlashCode == 1) ? EV_INFO
-                                                  : severityForFlashCode(g_confirmedFlashCode);
+  EventSeverity sev = (g_flash.confirmedCode == 1) ? EV_INFO
+                                                  : severityForFlashCode(g_flash.confirmedCode);
   sendSyslog(sev, "heartbeat", msg);
 }
 
@@ -1336,11 +1321,7 @@ bool tslRecover() {
 // We can't read the LED right now. That is not the same as the LED being dark,
 // so the status becomes unknown rather than pilot out.
 void setFlashUnknown() {
-  g_confirmedFlashCode = -1;
-  g_pendingFlashCount = -1;
-  g_flashCount = 0;
-  g_flashState = FLASH_WAITING;
-  g_lastFlashTime = millis();
+  flashSetUnknown(g_flash, millis());
   g_haStatusChanged = true;
 }
 
@@ -1361,7 +1342,7 @@ void processFlashDetection() {
     g_tslLastRetry = now;
     if (g_tslFound ? tslRecover() : (g_tslFound = initTSL2591())) {
       g_tslFault = false;
-      g_lastSampleDone = 0;
+      g_flash.lastSampleMs = 0;
       g_tslLastCfgCheck = now;
       logEvent(EV_INFO, "sensor", "Light sensor OK");
     }
@@ -1402,124 +1383,49 @@ void processFlashDetection() {
     g_calibTotal += reading;
     if (--g_calibRemaining == 0) {
       uint16_t avg = g_calibTotal / 10;
-      g_cfg.lightBaseline = avg;
-      g_cfg.lightThreshold = avg * 2 + 50;
-      g_lightBaseline = avg;
-      g_moSavePending = true;
-      char msg[64];
-      snprintf(msg, sizeof(msg), "Calibrated: baseline=%u threshold=%u", g_cfg.lightBaseline, g_cfg.lightThreshold);
+      uint16_t thresh;
+      char msg[80];
+      if (calibrationThreshold(avg, &thresh)) {
+        g_cfg.lightBaseline = avg;
+        g_cfg.lightThreshold = thresh;
+        g_flash.baseline = avg;
+        g_moSavePending = true;
+        snprintf(msg, sizeof(msg), "Calibrated: baseline=%u threshold=%u", g_cfg.lightBaseline, g_cfg.lightThreshold);
+      } else {
+        // Saving avg*2+50 here used to wrap past 65535 to a tiny threshold
+        snprintf(msg, sizeof(msg), "Calibration rejected: too bright (avg=%u), kept threshold=%u",
+                 avg, g_cfg.lightThreshold);
+      }
       addLog(msg);
     }
   }
 
-  // "No flash for 10 s" only means something if we were looking the whole time.
-  // A blocked loop() (HA pushes over a bad link, say) misses flashes, so restart
-  // the window instead of counting it towards pilot out.
-  if (g_lastSampleDone != 0 && now - g_lastSampleDone > FLASH_SAMPLE_GAP_MS && g_flashState == FLASH_WAITING) {
-    g_lastFlashTime = now;
-  }
-  g_lastSampleDone = now;
-
   // Debug: print raw values every 500ms
   static unsigned long lastDebugPrint = 0;
   if (now - lastDebugPrint >= 500) {
-    uint16_t threshold = g_cfg.lightThreshold > 0 ? g_cfg.lightThreshold : (g_lightBaseline * 2 + 50);
-    Serial.printf("LIGHT: full=%u ir=%u baseline=%u threshold=%u %s\n",
-                  full, ir, g_lightBaseline, threshold, reading > threshold ? "<<FLASH>>" : "");
+    uint32_t threshold = flashThreshold(g_cfg.lightThreshold, g_flash.baseline);
+    Serial.printf("LIGHT: full=%u ir=%u baseline=%u threshold=%lu %s\n",
+                  full, ir, g_flash.baseline, (unsigned long)threshold, reading > threshold ? "<<FLASH>>" : "");
     lastDebugPrint = now;
   }
 
-  // Update baseline with exponential moving average (slow decay)
-  if (g_lightBaseline == 0) {
-    g_lightBaseline = reading;
-  } else if (reading < g_lightBaseline + 10) {
-    // Only update baseline when light is not flashing
-    g_lightBaseline = (g_lightBaseline * 15 + reading) / 16;
-  }
+  // The state machine itself lives in detectors.h (host-tested)
+  int pendingBefore = g_flash.pendingCount;
+  FlashStepResult r = flashStep(g_flash, now, reading, g_cfg.lightThreshold, g_bootTime);
 
-  // Determine if light is "high" (flash detected)
-  uint16_t threshold = g_cfg.lightThreshold > 0 ? g_cfg.lightThreshold : (g_lightBaseline * 2 + 50);
-  bool lightHigh = reading > threshold;
-
-  // Track peak for debug
-  if (reading > g_lightPeak) g_lightPeak = reading;
-
-  // Steady light above the threshold (a room light, a flashlight) hides the LED.
-  // No edges then doesn't mean no flashes.
-  if (!lightHigh) {
-    g_lightHighSince = 0;
-  } else if (g_lightHighSince == 0) {
-    g_lightHighSince = now;
-  } else if (now - g_lightHighSince > LIGHT_BLIND_UNKNOWN_MS && g_confirmedFlashCode != -1) {
-    setFlashUnknown();
+  if (r.events & FE_BLINDED) {
+    g_haStatusChanged = true;
     logEvent(EV_WARNING, "sensor", "Steady light on the sensor — flash status unknown");
   }
-
-  // Rising edge detection
-  bool risingEdge = lightHigh && !g_lastLightHigh;
-  g_lastLightHigh = lightHigh;
-
-  switch (g_flashState) {
-    case FLASH_WAITING:
-      if (risingEdge) {
-        g_flashCount = 1;
-        g_lastFlashTime = now;
-        g_flashState = FLASH_COUNTING;
-      } else if (lightHigh) {
-        g_lastFlashTime = now;   // Blinded or mid-flash: no verdict yet
-      } else if (now - g_lastFlashTime > PILOT_OUT_TIMEOUT_MS && g_lastFlashTime > 0) {
-        // No flash for >10 seconds
-        g_flashCount = 0;
-        g_flashState = FLASH_PAUSE_DETECTED;
-      } else if (g_lastFlashTime == 0 && now - g_bootTime > PILOT_OUT_TIMEOUT_MS) {
-        // Never seen a flash since boot
-        g_flashCount = 0;
-        g_flashState = FLASH_PAUSE_DETECTED;
-      }
-      break;
-
-    case FLASH_COUNTING:
-      if (risingEdge && (now - g_lastFlashTime > FLASH_DEBOUNCE_MS)) {
-        g_flashCount++;
-        g_lastFlashTime = now;
-      } else if (now - g_lastFlashTime > FLASH_GAP_TIMEOUT_MS) {
-        // Gap detected — pattern complete
-        g_flashState = FLASH_PAUSE_DETECTED;
-      }
-      break;
-
-    case FLASH_PAUSE_DETECTED: {
-      // Use flash count from this cycle (g_flashCount is set by COUNTING state)
-      // For pilot-out detection, g_flashCount stays at 0 since we never entered COUNTING
-      int count = g_flashCount;
-      Serial.printf("PAUSE: count=%d pending=%d confirmed=%d\n", count, g_pendingFlashCount, g_confirmedFlashCode);
-
-      if (g_pendingFlashCount == count) {
-        // Same count two cycles in a row — confirmed
-        int prevCode = g_confirmedFlashCode;
-        g_confirmedFlashCode = count;
-        g_flashState = FLASH_WAITING;
-        g_lastFlashTime = millis();
-
-        if (prevCode != g_confirmedFlashCode) {
-          const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
-          logEvent(severityForFlashCode(g_confirmedFlashCode), "status",
-                   "Flash code %d: %s", g_confirmedFlashCode,
-                   info ? info->text : "Unknown code");
-          g_haStatusChanged = true;
-        }
-      } else {
-        g_pendingFlashCount = count;
-        g_flashState = FLASH_WAITING;
-        g_lastFlashTime = millis();
-      }
-      break;
-    }
-
-    case FLASH_CONFIRMED:
-      g_flashState = FLASH_WAITING;
-      g_lastFlashTime = millis();
-      break;
+  if (r.events & FE_PAUSE) {
+    Serial.printf("PAUSE: count=%d pending=%d confirmed=%d\n", r.pauseCount, pendingBefore, g_flash.confirmedCode);
+  }
+  if (r.events & FE_CODE_CHANGED) {
+    const FlashCodeInfo* info = getFlashCodeInfo(g_flash.confirmedCode);
+    logEvent(severityForFlashCode(g_flash.confirmedCode), "status",
+             "Flash code %d: %s", g_flash.confirmedCode,
+             info ? info->text : "Unknown code");
+    g_haStatusChanged = true;
   }
 }
 
@@ -1546,8 +1452,9 @@ void processTemperature() {
     g_lastTempRead = now;
 
     float tempC = g_ds18b20.getTempC(g_ds18b20Addr);
-    // 85.0 is the DS18B20's power-on value: a glitched probe, not a 185F pipe
-    if (tempC == DEVICE_DISCONNECTED_C || tempC == 85.0f) {
+    // -127 / -25x are library fault codes, 85.0 is the power-on value of a
+    // glitched probe; anything outside the DS18B20's range isn't a pipe temp
+    if (!tempReadingValid(tempC)) {
       // Edge-triggered: a permanently unplugged probe must not write an event
       // every 10 seconds for as long as it stays unplugged.
       if (!g_tempReadFailed) {
@@ -1565,14 +1472,12 @@ void processTemperature() {
     g_currentTempF = tempC * 9.0 / 5.0 + 32.0;
 
     // Store in slope-detection buffer
-    g_tempHistory2Min[g_tempHistIdx] = g_currentTempF;
-    g_tempHistIdx = (g_tempHistIdx + 1) % 60;
-    if (g_tempHistCount < 60) g_tempHistCount++;
+    cycleAddReading(g_cycle, g_currentTempF);
 
     // Store in graph history (every 2 minutes)
     if (now - g_lastTempGraphSample >= 120000 || g_lastTempGraphSample == 0) {
       g_tempGraphData[g_tempGraphHead] = g_currentTempF;
-      g_tempGraphBurner[g_tempGraphHead] = g_burnerActive;
+      g_tempGraphBurner[g_tempGraphHead] = g_cycle.burnerActive;
       g_tempGraphHead = (g_tempGraphHead + 1) % TEMP_HISTORY_SIZE;
       if (g_tempGraphCount < TEMP_HISTORY_SIZE) g_tempGraphCount++;
       g_lastTempGraphSample = now;
@@ -1589,88 +1494,73 @@ void processTemperature() {
 // Log only transitions across the warning/critical thresholds. Without edge
 // tracking a hot tank would write an event every 10 seconds and drown the log.
 void checkTempThresholds() {
-  if (isnan(g_currentTempF)) return;
-
   // Small hysteresis band so a reading hovering on the line doesn't oscillate
   const float HYST = 2.0;
 
-  if (!g_tempCritActive && g_currentTempF >= g_cfg.criticalTemp) {
-    g_tempCritActive = true;
-    logEvent(EV_CRITICAL, "temp", "Temperature CRITICAL: %.1fF (threshold %.0fF)",
-             g_currentTempF, g_cfg.criticalTemp);
-  } else if (g_tempCritActive && g_currentTempF < g_cfg.criticalTemp - HYST) {
-    g_tempCritActive = false;
-    logEvent(EV_INFO, "temp", "Temperature back below critical: %.1fF", g_currentTempF);
+  switch (alertEdge(g_tempCritActive, g_currentTempF, g_cfg.criticalTemp, HYST)) {
+    case EDGE_RISE:
+      logEvent(EV_CRITICAL, "temp", "Temperature CRITICAL: %.1fF (threshold %.0fF)",
+               g_currentTempF, g_cfg.criticalTemp);
+      break;
+    case EDGE_FALL:
+      logEvent(EV_INFO, "temp", "Temperature back below critical: %.1fF", g_currentTempF);
+      break;
+    default: break;
   }
 
-  if (!g_tempWarnActive && g_currentTempF >= g_cfg.highTempWarning) {
-    g_tempWarnActive = true;
-    logEvent(EV_WARNING, "temp", "Temperature high: %.1fF (threshold %.0fF)",
-             g_currentTempF, g_cfg.highTempWarning);
-  } else if (g_tempWarnActive && g_currentTempF < g_cfg.highTempWarning - HYST) {
-    g_tempWarnActive = false;
-    logEvent(EV_INFO, "temp", "Temperature back to normal: %.1fF", g_currentTempF);
+  switch (alertEdge(g_tempWarnActive, g_currentTempF, g_cfg.highTempWarning, HYST)) {
+    case EDGE_RISE:
+      logEvent(EV_WARNING, "temp", "Temperature high: %.1fF (threshold %.0fF)",
+               g_currentTempF, g_cfg.highTempWarning);
+      break;
+    case EDGE_FALL:
+      logEvent(EV_INFO, "temp", "Temperature back to normal: %.1fF", g_currentTempF);
+      break;
+    default: break;
   }
 }
 
 void detectHeatingCycle() {
-  // Readings in 5 minutes at the configured interval (the buffer holds 60)
-  int window = constrain(300 / max((int)g_cfg.tempReadInterval, 1), 1, 59);
-  if (g_tempHistCount <= window) return;  // Need at least 5 minutes of data
+  unsigned long now = millis();
+  uint32_t durationSec = 0;
 
-  // Calculate temperature rise over the last 5 minutes. The newest reading is at
-  // g_tempHistIdx - 1, so this is `window` readings before it.
-  int oldest = (g_tempHistIdx - 1 - window + 60) % 60;
-  float tempRise = g_currentTempF - g_tempHistory2Min[oldest];
-
-  if (!g_burnerActive) {
-    // Detect burner ON: temperature rising >2F in 5 minutes
-    if (tempRise > CYCLE_TEMP_RISE_THRESHOLD) {
-      g_burnerActive = true;
-      g_cycleStartTime = millis();
-      g_cycleStartTemp = g_currentTempF;
-      g_cyclePeakTemp = g_currentTempF;
+  // Start/stop decision lives in detectors.h (host-tested)
+  switch (cycleDetect(g_cycle, g_currentTempF, now, g_cfg.tempReadInterval, &durationSec)) {
+    case CE_STARTED:
       addLog("Heating cycle started");
       g_haStatusChanged = true;
-    }
-  } else {
-    // Track peak
-    if (g_currentTempF > g_cyclePeakTemp) {
-      g_cyclePeakTemp = g_currentTempF;
-    }
+      break;
 
-    // Detect burner OFF: 5-min slope has gone flat or negative
-    // (temp stopped climbing = burner is no longer heating)
-    if (tempRise <= 0.0) {
-      g_burnerActive = false;
-
-      // Record cycle
+    case CE_ENDED: {
       HeatingCycle cycle;
       struct tm timeinfo;
       if (localNow(&timeinfo)) {
-        cycle.startTime = mktime(&timeinfo) - (millis() - g_cycleStartTime) / 1000;
+        cycle.startTime = mktime(&timeinfo) - durationSec;
       } else {
-        cycle.startTime = (millis() - g_cycleStartTime) / 1000;  // Relative
+        cycle.startTime = durationSec;  // Relative
       }
-      cycle.endTime = cycle.startTime + (millis() - g_cycleStartTime) / 1000;
-      cycle.durationSec = (millis() - g_cycleStartTime) / 1000;
-      cycle.peakTempF = g_cyclePeakTemp;
+      cycle.endTime = cycle.startTime + durationSec;
+      cycle.durationSec = durationSec;
+      cycle.peakTempF = g_cycle.peakTempF;
       cycle.active = false;
 
       // Store in circular buffer
       g_cycles[g_cycleHead] = cycle;
       g_cycleHead = (g_cycleHead + 1) % MAX_CYCLES;
       if (g_cycleCount < MAX_CYCLES) g_cycleCount++;
-      g_lastCycleEndMs = millis();
+      g_lastCycleEndMs = now;
 
-      // Update hourly bucket
       updateHourlyBucket(cycle.durationSec);
 
       char msg[64];
-      snprintf(msg, sizeof(msg), "Heating cycle ended: %lus, peak %.1fF", cycle.durationSec, cycle.peakTempF);
+      snprintf(msg, sizeof(msg), "Heating cycle ended: %lus, peak %.1fF",
+               (unsigned long)cycle.durationSec, cycle.peakTempF);
       addLog(msg);
       g_haStatusChanged = true;
+      break;
     }
+
+    default: break;
   }
 }
 
@@ -1678,20 +1568,12 @@ void detectHeatingCycle() {
 // cycle whatever the time gap, so the "24h" chart was really the last 24 cycles.
 void advanceHourlyBuckets() {
   if (!timeIsSynced()) return;
-  uint32_t hour = (uint32_t)time(nullptr) / 3600;
-  if (g_hourlyEpochHour == 0) g_hourlyEpochHour = hour;
-  uint32_t steps = min(hour - g_hourlyEpochHour, (uint32_t)HOURLY_BUCKETS);
-  for (uint32_t i = 0; i < steps; i++) {
-    g_hourlyHead = (g_hourlyHead + 1) % HOURLY_BUCKETS;
-    g_hourlyHeatMin[g_hourlyHead] = 0;
-  }
-  g_hourlyEpochHour = hour;
+  hourlyAdvance(g_hourly, (uint32_t)time(nullptr) / 3600);
 }
 
 void updateHourlyBucket(uint32_t durationSec) {
   if (!timeIsSynced()) return;
-  advanceHourlyBuckets();
-  g_hourlyHeatMin[g_hourlyHead] += durationSec / 60.0;
+  hourlyAdd(g_hourly, (uint32_t)time(nullptr) / 3600, durationSec);
 }
 
 // Helper: count cycles today and total heat time
@@ -1731,7 +1613,7 @@ uint16_t tempToColor(float tempF) {
 }
 
 uint16_t statusColor() {
-  const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
+  const FlashCodeInfo* info = getFlashCodeInfo(g_flash.confirmedCode);
   return info ? info->color : TFT_DARKGREY;
 }
 
@@ -1747,7 +1629,7 @@ void drawScreenStatus() {
   g_sprite.drawFastHLine(10, 24, 300, TFT_DARKGREY);
 
   // Status
-  const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
+  const FlashCodeInfo* info = getFlashCodeInfo(g_flash.confirmedCode);
   const char* statusText = info ? info->text : "Detecting...";
   uint16_t sColor = info ? info->color : TFT_DARKGREY;
 
@@ -1761,13 +1643,13 @@ void drawScreenStatus() {
   g_sprite.setTextColor(TFT_WHITE, TFT_BLACK);
   g_sprite.drawString("Flash Code:", 10, 52, 2);
   char codeStr[8];
-  snprintf(codeStr, sizeof(codeStr), "%d", g_confirmedFlashCode >= 0 ? g_confirmedFlashCode : -1);
+  snprintf(codeStr, sizeof(codeStr), "%d", g_flash.confirmedCode >= 0 ? g_flash.confirmedCode : -1);
   g_sprite.setTextColor(sColor, TFT_BLACK);
-  g_sprite.drawString(g_confirmedFlashCode >= 0 ? codeStr : "?", 110, 52, 2);
+  g_sprite.drawString(g_flash.confirmedCode >= 0 ? codeStr : "?", 110, 52, 2);
 
   // Animated flash dots
-  if (g_confirmedFlashCode > 0) {
-    int dotCount = g_confirmedFlashCode;
+  if (g_flash.confirmedCode > 0) {
+    int dotCount = g_flash.confirmedCode;
     int startX = 10;
     int dotY = 74;
     unsigned long cycle = (millis() / 300) % (dotCount + 3);  // Animate
@@ -1799,9 +1681,9 @@ void drawScreenStatus() {
   // Burner status
   g_sprite.setTextColor(TFT_WHITE, TFT_BLACK);
   g_sprite.drawString("Burner:", 10, 116, 2);
-  g_sprite.setTextColor(g_burnerActive ? TFT_ORANGE : TFT_GREEN, TFT_BLACK);
-  g_sprite.drawString(g_burnerActive ? "ON" : "OFF", 80, 116, 2);
-  if (g_burnerActive) {
+  g_sprite.setTextColor(g_cycle.burnerActive ? TFT_ORANGE : TFT_GREEN, TFT_BLACK);
+  g_sprite.drawString(g_cycle.burnerActive ? "ON" : "OFF", 80, 116, 2);
+  if (g_cycle.burnerActive) {
     // Flame icon: outer orange flame + inner yellow core
     int fx = 108, fy = 114;
     g_sprite.fillTriangle(fx, fy+12, fx-5, fy+2, fx+5, fy+2, TFT_ORANGE);
@@ -1881,14 +1763,14 @@ void drawScreenCycles() {
   // Find max for scaling
   float maxMin = 1.0;
   for (int i = 0; i < 24; i++) {
-    int idx = (g_hourlyHead - i + HOURLY_BUCKETS) % HOURLY_BUCKETS;
-    if (g_hourlyHeatMin[idx] > maxMin) maxMin = g_hourlyHeatMin[idx];
+    int idx = (g_hourly.head - i + HOURLY_BUCKETS) % HOURLY_BUCKETS;
+    if (g_hourly.heatMin[idx] > maxMin) maxMin = g_hourly.heatMin[idx];
   }
 
   // Draw bars (oldest on the left, current hour on the right)
   for (int i = 0; i < 24; i++) {
-    int idx = (g_hourlyHead - (23 - i) + HOURLY_BUCKETS) % HOURLY_BUCKETS;
-    float val = g_hourlyHeatMin[idx];
+    int idx = (g_hourly.head - (23 - i) + HOURLY_BUCKETS) % HOURLY_BUCKETS;
+    float val = g_hourly.heatMin[idx];
     int barH = (int)(val / maxMin * chartHeight);
     if (barH < 1 && val > 0) barH = 1;
 
@@ -2002,8 +1884,8 @@ void drawScreenHotWater() {
   g_sprite.drawString(g_tslFault ? "Light Sensor Fault" : "Hot Water", 160, 50, 4);
 
   // ON or OFF — fills bottom half, bold
-  bool on = (g_confirmedFlashCode == 1);
-  bool unknown = (g_confirmedFlashCode == -1);   // Still detecting, or can't see the LED
+  bool on = (g_flash.confirmedCode == 1);
+  bool unknown = (g_flash.confirmedCode == -1);   // Still detecting, or can't see the LED
   uint16_t stateColor = unknown ? TFT_DARKGREY : on ? TFT_GREEN : TFT_RED;
   const char* stateText = unknown ? "?" : on ? "ON" : "OFF";
 
@@ -2013,7 +1895,7 @@ void drawScreenHotWater() {
   g_sprite.setTextSize(1);
 
   // Flame icon next to "ON" when burner is firing
-  if (on && g_burnerActive) {
+  if (on && g_cycle.burnerActive) {
     int fx = 245, fy = 115;
     g_sprite.fillTriangle(fx, fy+32, fx-18, fy-2,  fx+18, fy-2,  TFT_ORANGE);
     g_sprite.fillTriangle(fx, fy-32, fx-14, fy+14, fx+14, fy+14, TFT_ORANGE);
@@ -2378,7 +2260,7 @@ void motionTick() {
 // code and "unknown" (no pattern confirmed yet) keep it lit so the problem is
 // visible to whoever walks up to the tank.
 bool heaterAllowsScreenOff() {
-  return g_confirmedFlashCode == 1;
+  return g_flash.confirmedCode == 1;
 }
 
 // Why the display is being held on, for /api/motion and /api/debug
@@ -2505,18 +2387,18 @@ void pushToHomeAssistant() {
   // Small delays between calls to avoid overwhelming ESP32 WiFi stack.
   // The first request that can't reach HA ends the round: the rest would each
   // burn their own timeout, and the next round is only 30 s away.
-  if (!pushHAEntity("sensor", "status", getFlashCodeInfo(g_confirmedFlashCode) ? getFlashCodeInfo(g_confirmedFlashCode)->text : "Unknown", "")) return;
+  if (!pushHAEntity("sensor", "status", getFlashCodeInfo(g_flash.confirmedCode) ? getFlashCodeInfo(g_flash.confirmedCode)->text : "Unknown", "")) return;
   delay(100);
 
   char valBuf[16];
-  snprintf(valBuf, sizeof(valBuf), "%d", g_confirmedFlashCode);
+  snprintf(valBuf, sizeof(valBuf), "%d", g_flash.confirmedCode);
   if (!pushHAEntity("sensor", "flash_code", valBuf, "")) return;
   delay(100);
 
   // Push pilot_out binary sensor for HomeKit integration
   // Unknown (-1, right after every boot) is not a problem report
   if (!pushHAEntity("binary_sensor", "pilot_out",
-    g_confirmedFlashCode >= 0 && g_confirmedFlashCode != 1 ? "on" : "off", "problem")) return;
+    g_flash.confirmedCode >= 0 && g_flash.confirmedCode != 1 ? "on" : "off", "problem")) return;
 
   // Only push temperature-related entities if DS18B20 is connected
   if (g_ds18b20Found) {
@@ -2525,7 +2407,7 @@ void pushToHomeAssistant() {
       if (!pushHAEntity("sensor", "temperature", valBuf, g_cfg.useFahrenheit ? "°F" : "°C")) return;
     }
 
-    if (!pushHAEntity("binary_sensor", "burner", g_burnerActive ? "on" : "off", "")) return;
+    if (!pushHAEntity("binary_sensor", "burner", g_cycle.burnerActive ? "on" : "off", "")) return;
 
     int ct; uint32_t ts;
     getCyclesToday(ct, ts);
@@ -2555,7 +2437,7 @@ bool pushHAEvent() {
   doc["severity"] = EVENT_SEVERITY_NAME[g_haEventSeverity];
   doc["category"] = g_haEventCategory;
   doc["message"]  = g_haEventMessage;
-  doc["flash_code"] = g_confirmedFlashCode;
+  doc["flash_code"] = g_flash.confirmedCode;
   if (!isnan(g_currentTempF)) doc["temperature_f"] = roundf(g_currentTempF * 10) / 10.0;
 
   String payload;
@@ -2780,7 +2662,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <div class="row">
   <div>
     <label>Syslog Host</label>
-    <input type="text" name="sysHost" value="%SYS_HOST%" placeholder="netwatch.mf">
+    <input type="text" name="sysHost" value="%SYS_HOST%" placeholder="syslog.example.com">
   </div>
   <div>
     <label>Syslog Port (UDP)</label>
@@ -3440,8 +3322,8 @@ void setupWebServer() {
   g_server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
     JsonDocument doc;
 
-    doc["status_code"] = g_confirmedFlashCode;
-    const FlashCodeInfo* info = getFlashCodeInfo(g_confirmedFlashCode);
+    doc["status_code"] = g_flash.confirmedCode;
+    const FlashCodeInfo* info = getFlashCodeInfo(g_flash.confirmedCode);
     doc["status_text"] = info ? info->text : "Unknown";
     doc["severity"] = info ? info->severity : "UNKNOWN";
     if (isnan(g_currentTempF)) {
@@ -3451,7 +3333,7 @@ void setupWebServer() {
       doc["temperature_f"] = roundf(g_currentTempF * 10) / 10;
       doc["temperature_c"] = roundf(g_currentTempC * 10) / 10;
     }
-    doc["burner_active"] = g_burnerActive;
+    doc["burner_active"] = g_cycle.burnerActive;
 
     if (g_cycleCount > 0) {
       int lastIdx = (g_cycleHead - 1 + MAX_CYCLES) % MAX_CYCLES;
@@ -3470,7 +3352,7 @@ void setupWebServer() {
     doc["wifi_rssi"] = g_wifiConnected ? WiFi.RSSI() : 0;
     doc["free_heap"] = ESP.getFreeHeap();
     doc["light_sensor_als_raw"] = g_lastReading;
-    doc["light_sensor_baseline"] = g_lightBaseline;
+    doc["light_sensor_baseline"] = g_flash.baseline;
     doc["screen_off"] = g_screenOff;
     doc["motion_state"] = motionStateName();
 
@@ -3495,8 +3377,8 @@ void setupWebServer() {
 
     JsonArray hourly = doc["hourly_heat_minutes"].to<JsonArray>();
     for (int i = 0; i < HOURLY_BUCKETS; i++) {
-      int idx = (g_hourlyHead - HOURLY_BUCKETS + 1 + i + HOURLY_BUCKETS) % HOURLY_BUCKETS;
-      hourly.add(roundf(g_hourlyHeatMin[idx] * 10) / 10);
+      int idx = (g_hourly.head - HOURLY_BUCKETS + 1 + i + HOURLY_BUCKETS) % HOURLY_BUCKETS;
+      hourly.add(roundf(g_hourly.heatMin[idx] * 10) / 10);
     }
 
     JsonObject tempLog = doc["temperature_log"].to<JsonObject>();
@@ -3525,6 +3407,23 @@ void setupWebServer() {
     doc["prev_stage"] = g_prevValid ? STAGE_NAMES[g_prevStage] : "";
     doc["prev_uptime_sec"] = g_prevValid ? g_prevUptimeSec : 0;
     doc["tsl_fault"] = g_tslFault;
+
+    // Time between light readings since boot. A flash (~150-250 ms) can fall
+    // entirely between readings more than GAP_BLIND_MS apart; blind_while_waiting
+    // counts those gaps in the state where a missed flash moves towards pilot out.
+    JsonObject sm = doc["sampling"].to<JsonObject>();
+    JsonObject hist = sm["gap_hist_ms"].to<JsonObject>();
+    for (int i = 0; i < GAP_BUCKETS; i++) {
+      char key[12];
+      if (i < GAP_BUCKETS - 1) snprintf(key, sizeof(key), "le_%lu", (unsigned long)GAP_BUCKET_MAX_MS[i]);
+      else snprintf(key, sizeof(key), "gt_%lu", (unsigned long)GAP_BUCKET_MAX_MS[GAP_BUCKETS - 2]);
+      hist[key] = g_flash.gaps.count[i];
+    }
+    sm["max_gap_ms"] = g_flash.gaps.maxMs;
+    sm["blind_threshold_ms"] = GAP_BLIND_MS;
+    sm["blind_gaps"] = gapBlindCount(g_flash.gaps);
+    sm["blind_total_ms"] = g_flash.gaps.blindMs;
+    sm["blind_while_waiting"] = g_flash.gaps.blindWaiting;
     doc["free_heap"] = ESP.getFreeHeap();
     doc["free_psram"] = ESP.getFreePsram();
     doc["chip_model"] = ESP.getChipModel();
@@ -3613,16 +3512,16 @@ void setupWebServer() {
 
     doc["tsl2591_found"] = g_tslFound;
     doc["ds18b20_found"] = g_ds18b20Found;
-    doc["light_baseline"] = g_lightBaseline;
-    doc["light_peak"] = g_lightPeak;
+    doc["light_baseline"] = g_flash.baseline;
+    doc["light_peak"] = g_flash.peak;
     doc["light_threshold"] = g_cfg.lightThreshold;
-    doc["flash_state"] = (int)g_flashState;
-    doc["flash_count"] = g_flashCount;
-    doc["confirmed_flash_code"] = g_confirmedFlashCode;
-    doc["pending_flash_count"] = g_pendingFlashCount;
+    doc["flash_state"] = (int)g_flash.state;
+    doc["flash_count"] = g_flash.count;
+    doc["confirmed_flash_code"] = g_flash.confirmedCode;
+    doc["pending_flash_count"] = g_flash.pendingCount;
 
     doc["current_temp_f"] = g_currentTempF;
-    doc["burner_active"] = g_burnerActive;
+    doc["burner_active"] = g_cycle.burnerActive;
     doc["cycle_count"] = g_cycleCount;
     doc["temp_graph_count"] = g_tempGraphCount;
 
@@ -3869,7 +3768,7 @@ void appHealthCheck() {
   static bool armed = false;
   if (!armed) { armed = true; enableLoopWDT(); }
   unsigned long now = millis();
-  bool healthy = WiFi.status() == WL_CONNECTED && (g_lastSampleDone != 0 || !g_tslFound);
+  bool healthy = WiFi.status() == WL_CONNECTED && (g_flash.lastSampleMs != 0 || !g_tslFound);
   if (healthy && now >= APP_SETTLE_MS) {
     esp_ota_mark_app_valid_cancel_rollback();
     g_appPending = false;
@@ -4021,10 +3920,10 @@ void setup() {
   g_ds18b20Found = initDS18B20();
 
   // Initialize arrays
-  memset(g_tempHistory2Min, 0, sizeof(g_tempHistory2Min));
+  memset(g_cycle.hist, 0, sizeof(g_cycle.hist));
   memset(g_tempGraphData, 0, sizeof(g_tempGraphData));
   memset(g_tempGraphBurner, 0, sizeof(g_tempGraphBurner));
-  memset(g_hourlyHeatMin, 0, sizeof(g_hourlyHeatMin));
+  memset(g_hourly.heatMin, 0, sizeof(g_hourly.heatMin));
   memset(g_cycles, 0, sizeof(g_cycles));
   memset(g_log, 0, sizeof(g_log));
 

@@ -99,8 +99,12 @@ Full BOM, links, and wiring detail are in `CLAUDE.md`.
 
 ## Software
 
-Single-file Arduino sketch: `water_heater_monitor/water_heater_monitor.ino`.
-No build system beyond the Arduino IDE / `arduino-cli`.
+Arduino sketch: `water_heater_monitor/water_heater_monitor.ino` plus
+`water_heater_monitor/detectors.h` ✨ NEW (v1.9.3), which holds the decision
+logic (flash-code state machine, heating-cycle detector, hourly buckets,
+alert hysteresis, reading validation) with no Arduino dependencies so it can
+be compiled and tested on a computer. No build system beyond the Arduino IDE /
+`arduino-cli`.
 
 Architecture:
 
@@ -125,7 +129,15 @@ PAUSE_DETECTED ──[count matches previous cycle]──► CONFIRMED
 
 Two consecutive matching cycles must be observed before a status update is
 published, which rejects spurious flashes from ambient light or noise.
-A 10-second silence with no flashes is reported as status 0 (pilot out).
+No flash for 10 seconds counts as a pattern of 0; two of those in a row
+(about 22 s after the last flash) confirm status 0 (pilot out). Steady light
+on the sensor, a sensor fault, or a stalled loop() reports *unknown*, never
+pilot out.
+
+✨ NEW (v1.9.3): `/api/debug` → `sampling` shows how far apart light readings
+actually arrive (histogram, longest gap, time spent in gaps over 250 ms,
+which is long enough to miss a whole flash). The syslog heartbeat carries the
+same numbers as `gap_max_ms`, `gap_blind`, `gap_blind_wait` and `gap_blind_ms`.
 
 ### Cycle detection
 
@@ -166,9 +178,45 @@ Sample HA automation YAML for critical alerts, high-temp warnings, and
 daily summaries is in `CLAUDE.md`. Expose the entities via the HomeKit
 Bridge integration to also see them in Apple Home and ask Siri.
 
+## Site-specific config ✨ NEW (v1.9.3)
+
+Real hostnames stay out of this public repo. Copy
+`water_heater_monitor/local_config.example.h` to
+`water_heater_monitor/local_config.h` (gitignored) and set your defaults
+there, such as `DEFAULT_SYSLOG_HOST`. They only apply to a device with nothing
+saved; whatever is set in the web UI wins. Without the file, the syslog host
+defaults to empty (syslog off). `tools/ota-flash-when-reachable.sh` takes the
+device IP as an argument or `WATER_HEATER_IP`.
+
+## Tests ✨ NEW (v1.9.3)
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/
+```
+
+Needs a C++ compiler (`c++`/`g++`/`clang++`, or set `CXX`); no device,
+network, or Home Assistant. The tests compile `detectors.h` — the same code
+the firmware runs — into a small host library and drive it through ctypes.
+
+- `tests/test_properties.py` — **property-based tests** (Hypothesis): each
+  test states a rule that must hold for *every* input in a range — every
+  flash code and LED timing, noise, single-sample glitches, loop stalls,
+  steady light, millis() wrap-around, any temperature sequence, any clock
+  behaviour — and Hypothesis hunts for a counterexample. Runs are
+  deterministic (`derandomize=True`).
+- `tests/test_flash_detection.py` — scenario tests, a check that the `.ino`
+  really calls into `detectors.h`, and an end-to-end `arduino-cli compile`
+  (skipped if the esp32 core isn't installed).
+
+Two tests are marked `xfail(strict=True)`: they are known findings awaiting a
+decision (see CHANGELOG 2026-11-18). If one starts passing, pytest fails, so
+the marker gets removed when the behaviour is fixed.
+
 ## Project Status
 
-Currently running at v1.5.5 on the author's water heater with HA integration
+Currently running at v1.9.2 on the author's water heater (v1.9.3 built and
+tested, not yet flashed) with HA integration
 live. Phase 1–3 (core monitoring, cycle tracking, HA push) are functional;
 Phase 4–5 (mDNS, enclosure, polish) are in progress.
 

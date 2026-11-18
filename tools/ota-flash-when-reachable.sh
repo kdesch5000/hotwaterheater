@@ -8,20 +8,22 @@
 # the reachable windows are short and unpredictable.
 #
 # Usage:
-#   ./ota-flash-when-reachable.sh [device_ip] [bin_path]
+#   ./ota-flash-when-reachable.sh <device_ip> [bin_path]
+#   (or set WATER_HEATER_IP)
 #
 # Runs until it succeeds or MAX_WAIT_MIN elapses. Safe to leave running.
 
 set -uo pipefail
 
-DEVICE="${1:-192.168.86.95}"
+DEVICE="${1:-${WATER_HEATER_IP:-}}"
+[[ -n "$DEVICE" ]] || { echo "Usage: $0 <device_ip> [bin_path]  (or set WATER_HEATER_IP)"; exit 2; }
 BIN="${2:-$(dirname "$0")/../water_heater_monitor/build/esp32.esp32.lilygo_t_display_s3/water_heater_monitor.ino.bin}"
 POLL_SEC="${POLL_SEC:-15}"
 MAX_WAIT_MIN="${MAX_WAIT_MIN:-720}"   # 12 hours
 
 [[ -f "$BIN" ]] || { echo "No firmware at $BIN — run arduino-cli compile first."; exit 1; }
 
-MD5=$(md5 -q "$BIN")
+if command -v md5sum >/dev/null; then MD5=$(md5sum "$BIN" | cut -d" " -f1); else MD5=$(md5 -q "$BIN"); fi
 SIZE=$(wc -c < "$BIN" | tr -d ' ')
 echo "Firmware: $BIN"
 echo "  size=$SIZE md5=$MD5"

@@ -6,12 +6,12 @@
 # and a dead one looks identical to a quiet one. This script detects the
 # ABSENCE of heartbeats — the failure the syslog mirror exists to catch.
 #
-# Deploy on netwatch. Cron mails any output, so printing = alerting:
+# Deploy on the syslog collector. Cron mails any output, so printing = alerting:
 #   */10 * * * * /usr/local/bin/heartbeat-watchdog.sh
 #
 # Exits 0 when healthy and silent; exits 1 with a message when not.
 #
-# netwatch's rsyslog splits remote hosts into /var/log/remote/<hostname>.log
+# the syslog collector's rsyslog splits remote hosts into /var/log/remote/<hostname>.log
 # (see $template RemoteFile in /etc/rsyslog.d/) and timestamps them in ISO 8601,
 # not the traditional RFC 3164 "Aug 21 09:25:11" format.
 

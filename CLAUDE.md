@@ -39,14 +39,19 @@ Each pattern = N flashes, ~3 s pause, repeat. A status change requires the same 
 
 - Arduino IDE board: LilyGo T-Display-S3 (or ESP32S3 Dev Module); USB CDC On Boot **Enabled**; Flash 16MB; Partition "Default 4MB with spiffs".
 - TFT_eSPI must be pointed at the board: in `Arduino/libraries/TFT_eSPI/User_Setup_Select.h` comment out `#include <User_Setup.h>` and uncomment `#include <User_Setups/Setup206_LilyGo_T_Display_S3.h>`.
+- Production builds need `water_heater_monitor/local_config.h` (gitignored; copy `local_config.example.h`) so a factory-fresh device gets the real syslog host. GitHub (`git@github.com:kdesch5000/hotwaterheater.git`, public) is the system of record. Don't commit real hostnames or IPs; `test_no_site_specific_values_in_tracked_source` enforces it.
 - AsyncTCP and ESPAsyncWebServer come from GitHub ZIPs (me-no-dev), not Library Manager.
 - First flash over USB-C; after that, OTA via ElegantOTA at `http://<device-ip>/update`. First boot AP: SSID `WaterHeaterMonitor`, password `configure`, `http://192.168.4.1`.
 
 ## Conventions (match info-display-hub)
 
-- Single `.ino` file; TFT_eSprite double buffering; ESPAsyncWebServer; Preferences for config; no blocking delays in `loop()` — everything interval-based.
+- One `.ino` file plus `detectors.h` (pure decision logic: flash codes, heating cycles, hourly buckets, alert hysteresis, reading validation). Any new *decision* logic goes in `detectors.h` with no Arduino includes and uint32_t ms times, so `tests/` can compile and property-test it on the host; hardware, network, logging and display stay in the `.ino`. TFT_eSprite double buffering; ESPAsyncWebServer; Preferences for config; no blocking delays in `loop()` — everything interval-based.
 - `#define` for pins/constants at top; `struct`s for config/status/cycle data.
 - Prefixes: `g_` globals, `cfg_` config values. Functions `camelCase`; web handlers `handleXxx`; display `drawScreenXxx`.
 - Banner comment for each major section.
 - All HTML in a `const char CONFIG_HTML[] PROGMEM = R"rawliteral(...)rawliteral";` block.
 - Log important events to the circular log buffer (served at `/api/log`).
+
+## Tests
+
+`pytest tests/` (needs `requirements-dev.txt` and a host C++ compiler). Tests drive `detectors.h` through ctypes (`tests/harness/detectors_shim.cpp`, `tests/detectors_ffi.py`) — never re-implement firmware logic in Python; the old Python model drifted from the C++. When changing `detectors.h`, add or update the property in `tests/test_properties.py` that states the rule. The two `xfail(strict=True)` tests are open findings (CHANGELOG 2026-11-18), not flaky tests.

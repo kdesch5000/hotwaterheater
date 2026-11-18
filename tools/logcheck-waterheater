@@ -1,11 +1,11 @@
 # logcheck ignore rules for the water heater monitor
-# Install on netwatch as: /etc/logcheck/ignore.d.server/waterheater
+# Install on the syslog collector as: /etc/logcheck/ignore.d.server/waterheater
 #
 # ONLY NEEDED IF you add /var/log/remote/waterheater.log to
 # /etc/logcheck/logcheck.logfiles — as of 2026-08-21 logcheck does not
 # watch that file, so heartbeats are not reaching logcheck reports at all.
 #
-# netwatch's remote logs use ISO 8601 timestamps (2026-08-21T09:25:11-05:00),
+# the syslog collector's remote logs use ISO 8601 timestamps (2026-08-21T09:25:11-05:00),
 # not the RFC 3164 format the stock logcheck rules assume.
 #
 # Only HEALTHY heartbeats (flash_code=1) are ignored, so a pilot outage is

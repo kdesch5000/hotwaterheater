@@ -9,3 +9,6 @@ typescript
 
 # Crash dumps and ELFs (may contain Wi-Fi/HA secrets from RAM)
 crash-elf/
+
+# Site-specific firmware defaults (see local_config.example.h)
+water_heater_monitor/local_config.h
