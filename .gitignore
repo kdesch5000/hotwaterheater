@@ -6,3 +6,6 @@ typescript
 
 # Claude local settings
 .claude/settings.local.json
+
+# Crash dumps and ELFs (may contain Wi-Fi/HA secrets from RAM)
+crash-elf/

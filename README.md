@@ -175,3 +175,7 @@ Phase 4–5 (mDNS, enclosure, polish) are in progress.
 ## License
 
 MIT.
+
+## Known issues
+
+Motion screen-off (Wi-Fi CSI) is disabled by default since v1.9.2, so the display stays on. With it enabled, the board rebooted several times a day. A decoded crash dump from v1.9.1 shows a jump to address 0 in the Wi-Fi driver's interrupt handler (`wDev_ProcessFiq`) during `wDev_IndicateFrame`, with none of this project's code on the stack. Enabling it again from the config page brings that risk back.

@@ -1,3 +1,5 @@
+// v1.9.1 — 2026-10-30 — keep the crash dump, GET /api/coredump
+// v1.9.0 — 2026-10-30 — no false pilot-out from sensor faults or stalled sampling; crash dump + breadcrumb in the event log; OTA rollback; many fixes
 // v1.8.0 — 2026-10-26 — Wi-Fi CSI motion: display turns off when nobody's around (unless the heater has a fault)
 // v1.7.0 — 2026-08-20
 /*******************************************************************************
@@ -31,6 +33,10 @@
 #include <WiFiUdp.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <esp_ota_ops.h>
+#include <esp_core_dump.h>
+#include <esp_flash.h>
+#include <esp_rom_sys.h>
 #include "ping/ping_sock.h"
 #include <stdarg.h>
 
@@ -48,9 +54,13 @@
 /*******************************************************************************
  * CONFIGURATION CONSTANTS
  ******************************************************************************/
+#define FW_VERSION               "1.9.2"
 #define TSL2591_ADDR             0x29
 #define TEMP_READ_INTERVAL_MS    10000   // 10 seconds
-#define LIGHT_SAMPLE_INTERVAL_MS 50      // 50ms for flash detection
+#define TSL_CONVERT_MS           120     // ADC time for the 100 ms integration (library's wait)
+#define TSL_READ_FAILS           5       // Consecutive failed reads = sensor fault
+#define TSL_RETRY_MS             10000   // Re-init attempt while faulted or missing
+#define TSL_CFG_CHECK_MS         5000    // Confirm the sensor still has our gain/timing
 #define HA_PUSH_INTERVAL_MS      30000   // 30 seconds
 #define SCREEN_COUNT             4
 #define MAX_CYCLES               100
@@ -62,6 +72,8 @@
 #define FLASH_GAP_TIMEOUT_MS     2000   // >2s gap = end of pattern
 #define PILOT_OUT_TIMEOUT_MS     10000  // >10s no flash = pilot out
 #define FLASH_DEBOUNCE_MS        200    // Minimum time between flashes
+#define FLASH_SAMPLE_GAP_MS      1500   // A longer gap between samples = not actually watching
+#define LIGHT_BLIND_UNKNOWN_MS   60000  // Light steadily above threshold this long = status unknown
 
 // Temperature cycle detection
 #define CYCLE_TEMP_RISE_THRESHOLD 2.0   // 2 degrees F rise
@@ -109,6 +121,7 @@
 // longer than the interval itself — starving flash detection, the display and
 // the link watchdog. 2s is generous for a LAN and bounds the worst case.
 #define HA_HTTP_TIMEOUT_MS 2000
+#define HA_PUSH_MIN_GAP_MS 5000
 
 // Link health watchdog.
 //
@@ -309,6 +322,19 @@ unsigned long g_lastLightSampleTime = 0;
 bool g_lastLightHigh = false;
 uint16_t g_lightBaseline = 0;
 uint16_t g_lightPeak = 0;
+uint16_t g_lastReading = 0;
+bool g_tslConverting = false;
+unsigned long g_tslConvertStart = 0;
+uint8_t g_tslFails = 0;
+bool g_tslFault = false;               // Reads failing or settings lost: flash status is unknown
+unsigned long g_tslLastRetry = 0;
+unsigned long g_tslLastCfgCheck = 0;
+unsigned long g_lastSampleDone = 0;
+unsigned long g_lightHighSince = 0;    // 0 = not steadily above threshold
+uint8_t g_calibRemaining = 0;          // Samples left in an /api/calibrate run
+uint32_t g_calibTotal = 0;
+uint8_t g_i2cFound[8];                 // Boot scan; scanning live would fight flash detection for the bus
+int g_i2cFoundCount = 0;
 
 // Temperature state
 float g_currentTempF = NAN;
@@ -341,7 +367,8 @@ unsigned long g_lastTempGraphSample = 0;
 // Hourly heating minutes (circular, last 48h)
 float g_hourlyHeatMin[HOURLY_BUCKETS];
 int g_hourlyHead = 0;
-uint8_t g_lastRecordedHour = 255;
+uint32_t g_hourlyEpochHour = 0;   // time()/3600 of the head bucket; 0 = not started
+unsigned long g_lastCycleEndMs = 0;
 
 // Display state
 int g_currentScreen = 3;  // Default to Hot Water ON/OFF screen
@@ -381,6 +408,40 @@ bool g_apRetryInProgress = false;
 // Set by POST /api/events/format, acted on in loop(). The format must not run
 // inside the AsyncTCP handler — it blocks for seconds with the WDT disabled.
 volatile bool g_formatRequested = false;
+
+// Other work web handlers hand to loop(). Handlers run in the AsyncTCP task, so
+// blocking there trips its watchdog, and Preferences, WiFiUDP and the sensor bus
+// aren't safe to share with loop() without this.
+volatile bool g_clearLogRequested = false;
+volatile bool g_syslogTestRequested = false;
+volatile bool g_calibrateRequested = false;
+volatile unsigned long g_restartAt = 0;
+volatile bool g_moSavePending = false;    // Config changed: motionTick() in loop() saves it
+const char* appStateName();
+
+// What loop() was doing and for how long it had been up, kept across a reset, so
+// a reset with no crash dump (watchdog) still says where it happened.
+#define BREADCRUMB_MAGIC 0x57484D31
+RTC_NOINIT_ATTR uint32_t g_rtcMagic;
+RTC_NOINIT_ATTR uint32_t g_rtcStage;
+RTC_NOINIT_ATTR uint32_t g_rtcUptimeSec;
+RTC_NOINIT_ATTR uint32_t g_rtcCrashLogged;   // Crash dump already in the event log
+uint32_t g_prevStage = 0, g_prevUptimeSec = 0;
+bool g_prevValid = false;
+const char* const STAGE_NAMES[] = {"setup", "flash", "temp", "buttons", "display", "motion", "backlight",
+                                   "ha", "heartbeat", "ota", "timesync", "web-work", "ap-retry", "wifi", "link"};
+enum LoopStage { ST_SETUP, ST_FLASH, ST_TEMP, ST_BUTTONS, ST_DISPLAY, ST_MOTION, ST_BACKLIGHT,
+                 ST_HA, ST_HEARTBEAT, ST_OTA, ST_TIMESYNC, ST_WEBWORK, ST_APRETRY, ST_WIFI, ST_LINK };
+char g_lastCrash[128] = "";
+
+// Time helper. localNow(&t) spuriously fails if millis() ticks inside the
+// call, which skipped work and zeroed the day's cycle count at random.
+bool localNow(struct tm* ti) {
+  time_t t = time(nullptr);
+  if (t <= NTP_SYNC_EPOCH) return false;
+  localtime_r(&t, ti);
+  return true;
+}
 
 // Queued HA event. logEvent() only sets the flag; the HTTP POST happens in
 // pushToHomeAssistant(), which already runs in a context where blocking is
@@ -426,7 +487,7 @@ bool g_btn2Pressed = false;
 void addLog(const char* msg) {
   struct tm timeinfo;
   LogEntry& entry = g_log[g_logHead];
-  if (getLocalTime(&timeinfo, 0)) {
+  if (localNow(&timeinfo)) {
     entry.timestamp = mktime(&timeinfo);
   } else {
     entry.timestamp = millis() / 1000;
@@ -478,11 +539,9 @@ void performEventLogFormat() {
   addLog("Formatting FFat partition...");
   Serial.println("Formatting FFat...");
 
-  disableLoopWDT();
   disableCore0WDT();
   bool ok = FFat.format(false);   // false = quick format, not a full wipe
   enableCore0WDT();
-  enableLoopWDT();
 
   if (!ok) {
     addLog("FFat format FAILED");
@@ -506,16 +565,28 @@ void sendSyslog(EventSeverity sev, const char* category, const char* message) {
 
   char timestamp[20] = "";
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 0)) {
+  if (localNow(&timeinfo)) {
     // "Mmm dd hh:mm:ss" with a space-padded day, per RFC 3164
     strftime(timestamp, sizeof(timestamp), "%b %e %H:%M:%S", &timeinfo);
   }
+
+  // Resolve rarely: a lookup blocks for seconds when the link is bad, and this
+  // runs inside flash detection via logEvent().
+  static IPAddress syslogIp;
+  static unsigned long lastResolve = 0;
+  static bool resolved = false;
+  if (!resolved || millis() - lastResolve > 600000UL) {
+    lastResolve = millis();
+    IPAddress ip;
+    if (WiFi.hostByName(g_cfg.syslogHost, ip)) { syslogIp = ip; resolved = true; }
+  }
+  if (!resolved) return;
 
   char packet[512];  // Headroom for the heartbeat, which is longer than an event
   snprintf(packet, sizeof(packet), "<%u>%s %s %s: [%s] %s",
            pri, timestamp, SYSLOG_APPNAME, SYSLOG_APPNAME, category, message);
 
-  if (g_syslogUdp.beginPacket(g_cfg.syslogHost, g_cfg.syslogPort)) {
+  if (g_syslogUdp.beginPacket(syslogIp, g_cfg.syslogPort)) {
     g_syslogUdp.write((const uint8_t*)packet, strlen(packet));
     g_syslogUdp.endPacket();
   }
@@ -556,7 +627,7 @@ void sendHeartbeat() {
            "alive flash_code=%d status=\"%s\" temp_f=%s burner=%s cycles_today=%d "
            "heat_min_today=%lu rssi=%d uptime_s=%lu heap=%lu fs=%s "
            "probe_fail=%lu reassoc=%lu bssid=%s disc=%lu reason=%u "
-           "screen=%s motion=\"%s\"",
+           "screen=%s motion=\"%s\" fw=%s",
            g_confirmedFlashCode,
            info ? info->text : "Unknown",
            tempStr,
@@ -573,7 +644,8 @@ void sendHeartbeat() {
            (unsigned long)g_disconnectCount,
            g_lastDisconnectReason,
            g_screenOff ? "off" : "on",
-           motionStateName());
+           motionStateName(),
+           FW_VERSION);
 
   // Raise severity when the heater itself is unhappy, so a collector-side rule
   // can act on a heartbeat's contents as well as its absence.
@@ -792,7 +864,8 @@ void loadConfig() {
   strlcpy(g_cfg.probeHost,      g_prefs.getString("probeHost", "").c_str(),      sizeof(g_cfg.probeHost));
   g_cfg.probePort          = g_prefs.getUShort("probePort", 0);
   g_cfg.linkRebootMin      = g_prefs.getUShort("lnkRbtMin", DEFAULT_LINK_REBOOT_MIN);
-  g_cfg.motionMode         = g_prefs.getUChar("moMode", 1);
+  // Off by default: with CSI on, the board crashes inside the Wi-Fi driver (2026-10-30 dump)
+  g_cfg.motionMode         = g_prefs.getUChar("moMode", 0);
   g_cfg.motionOffMin       = g_prefs.getUShort("moOffMin", DEFAULT_MOTION_OFF_MIN);
   g_cfg.motionThresh       = g_prefs.getFloat("moThresh", 0);
   strlcpy(g_cfg.motionBssid,    g_prefs.getString("moBssid", "").c_str(),        sizeof(g_cfg.motionBssid));
@@ -908,7 +981,7 @@ bool initDS18B20() {
   g_ds18b20.setResolution(g_ds18b20Addr, 12);  // 12-bit = 0.0625C
   g_ds18b20.setWaitForConversion(false);        // Non-blocking
 
-  char addrStr[24];
+  char addrStr[32];
   snprintf(addrStr, sizeof(addrStr), "DS18B20 addr: %02X%02X%02X%02X%02X%02X%02X%02X",
            g_ds18b20Addr[0], g_ds18b20Addr[1], g_ds18b20Addr[2], g_ds18b20Addr[3],
            g_ds18b20Addr[4], g_ds18b20Addr[5], g_ds18b20Addr[6], g_ds18b20Addr[7]);
@@ -1101,7 +1174,7 @@ bool parseHostPort(const char* url, char* host, size_t hostLen, uint16_t* port) 
   memcpy(host, p, len);
   host[len] = '\0';
 
-  *port = 80;
+  *port = strncmp(url, "https:", 6) == 0 ? 443 : 80;
   if (*end == ':') *port = (uint16_t) atoi(end + 1);
   return *port != 0;
 }
@@ -1221,20 +1294,131 @@ EventSeverity severityForFlashCode(int code) {
   return EV_ERROR;
 }
 
+// Both channels in one transaction, unlike the library's getFullLuminosity(),
+// which blocks loop() for the conversion and returns garbage on a bus error.
+bool tslReadChannels(uint16_t& full, uint16_t& ir) {
+  Wire.beginTransmission(TSL2591_ADDR);
+  Wire.write(TSL2591_COMMAND_BIT | TSL2591_REGISTER_CHAN0_LOW);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((uint8_t)TSL2591_ADDR, (uint8_t)4) != 4) return false;
+  full = Wire.read();
+  full |= (uint16_t)Wire.read() << 8;
+  ir = Wire.read();
+  ir |= (uint16_t)Wire.read() << 8;
+  return true;
+}
+
+// A sensor that lost power and came back runs at 1x gain, too low to see the LED.
+// Only a re-init restores it, and until 1.9.0 only a reboot did one.
+bool tslConfigOk() {
+  Wire.beginTransmission(TSL2591_ADDR);
+  Wire.write(TSL2591_COMMAND_BIT | TSL2591_REGISTER_CONTROL);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((uint8_t)TSL2591_ADDR, (uint8_t)1) != 1) return false;
+  return Wire.read() == ((uint8_t)g_tsl.getTiming() | (uint8_t)g_tsl.getGain());
+}
+
+// Clock out a device stuck holding SDA, then bring the bus and the sensor back
+bool tslRecover() {
+  Wire.end();
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  pinMode(PIN_I2C_SCL, OUTPUT_OPEN_DRAIN);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(PIN_I2C_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delayMicroseconds(5);
+  }
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  return initTSL2591() && tslConfigOk();
+}
+
+// We can't read the LED right now. That is not the same as the LED being dark,
+// so the status becomes unknown rather than pilot out.
+void setFlashUnknown() {
+  g_confirmedFlashCode = -1;
+  g_pendingFlashCount = -1;
+  g_flashCount = 0;
+  g_flashState = FLASH_WAITING;
+  g_lastFlashTime = millis();
+  g_haStatusChanged = true;
+}
+
+void tslEnterFault(const char* why) {
+  g_tslFault = true;
+  g_tslConverting = false;
+  g_tslFails = 0;
+  g_tslLastRetry = millis() - TSL_RETRY_MS;   // First recovery attempt right away
+  setFlashUnknown();
+  logEvent(EV_ERROR, "sensor", "Light sensor %s — flash status unknown", why);
+}
+
 void processFlashDetection() {
-  if (!g_tslFound) return;
-
   unsigned long now = millis();
-  if (now - g_lastLightSampleTime < LIGHT_SAMPLE_INTERVAL_MS) return;
-  g_lastLightSampleTime = now;
 
-  // Read raw sensor data (fast path — no lux calculation)
-  uint32_t lum = g_tsl.getFullLuminosity();
-  uint16_t ir = lum >> 16;
-  uint16_t full = lum & 0xFFFF;
+  if (!g_tslFound || g_tslFault) {
+    if (now - g_tslLastRetry < TSL_RETRY_MS) return;
+    g_tslLastRetry = now;
+    if (g_tslFound ? tslRecover() : (g_tslFound = initTSL2591())) {
+      g_tslFault = false;
+      g_lastSampleDone = 0;
+      g_tslLastCfgCheck = now;
+      logEvent(EV_INFO, "sensor", "Light sensor OK");
+    }
+    return;
+  }
+
+  if (!g_tslConverting) {
+    g_tsl.enable();
+    g_tslConverting = true;
+    g_tslConvertStart = now;
+    return;
+  }
+  if (now - g_tslConvertStart < TSL_CONVERT_MS) return;
+  g_tslConverting = false;
+
+  uint16_t ir = 0, full = 0;
+  bool readOk = tslReadChannels(full, ir);
+  g_tsl.disable();
+  if (!readOk) {
+    if (++g_tslFails >= TSL_READ_FAILS) tslEnterFault("not responding");
+    return;
+  }
+  g_tslFails = 0;
+
+  if (now - g_tslLastCfgCheck >= TSL_CFG_CHECK_MS) {
+    g_tslLastCfgCheck = now;
+    if (!tslConfigOk()) {
+      tslEnterFault("lost its settings");
+      return;
+    }
+  }
 
   // Use full spectrum for flash detection — try IR channel if it gives better contrast
   uint16_t reading = full;
+  g_lastReading = reading;
+
+  if (g_calibRemaining > 0) {
+    g_calibTotal += reading;
+    if (--g_calibRemaining == 0) {
+      uint16_t avg = g_calibTotal / 10;
+      g_cfg.lightBaseline = avg;
+      g_cfg.lightThreshold = avg * 2 + 50;
+      g_lightBaseline = avg;
+      g_moSavePending = true;
+      char msg[64];
+      snprintf(msg, sizeof(msg), "Calibrated: baseline=%u threshold=%u", g_cfg.lightBaseline, g_cfg.lightThreshold);
+      addLog(msg);
+    }
+  }
+
+  // "No flash for 10 s" only means something if we were looking the whole time.
+  // A blocked loop() (HA pushes over a bad link, say) misses flashes, so restart
+  // the window instead of counting it towards pilot out.
+  if (g_lastSampleDone != 0 && now - g_lastSampleDone > FLASH_SAMPLE_GAP_MS && g_flashState == FLASH_WAITING) {
+    g_lastFlashTime = now;
+  }
+  g_lastSampleDone = now;
 
   // Debug: print raw values every 500ms
   static unsigned long lastDebugPrint = 0;
@@ -1260,6 +1444,17 @@ void processFlashDetection() {
   // Track peak for debug
   if (reading > g_lightPeak) g_lightPeak = reading;
 
+  // Steady light above the threshold (a room light, a flashlight) hides the LED.
+  // No edges then doesn't mean no flashes.
+  if (!lightHigh) {
+    g_lightHighSince = 0;
+  } else if (g_lightHighSince == 0) {
+    g_lightHighSince = now;
+  } else if (now - g_lightHighSince > LIGHT_BLIND_UNKNOWN_MS && g_confirmedFlashCode != -1) {
+    setFlashUnknown();
+    logEvent(EV_WARNING, "sensor", "Steady light on the sensor — flash status unknown");
+  }
+
   // Rising edge detection
   bool risingEdge = lightHigh && !g_lastLightHigh;
   g_lastLightHigh = lightHigh;
@@ -1270,6 +1465,8 @@ void processFlashDetection() {
         g_flashCount = 1;
         g_lastFlashTime = now;
         g_flashState = FLASH_COUNTING;
+      } else if (lightHigh) {
+        g_lastFlashTime = now;   // Blinded or mid-flash: no verdict yet
       } else if (now - g_lastFlashTime > PILOT_OUT_TIMEOUT_MS && g_lastFlashTime > 0) {
         // No flash for >10 seconds
         g_flashCount = 0;
@@ -1349,7 +1546,8 @@ void processTemperature() {
     g_lastTempRead = now;
 
     float tempC = g_ds18b20.getTempC(g_ds18b20Addr);
-    if (tempC == DEVICE_DISCONNECTED_C) {
+    // 85.0 is the DS18B20's power-on value: a glitched probe, not a 185F pipe
+    if (tempC == DEVICE_DISCONNECTED_C || tempC == 85.0f) {
       // Edge-triggered: a permanently unplugged probe must not write an event
       // every 10 seconds for as long as it stays unplugged.
       if (!g_tempReadFailed) {
@@ -1416,10 +1614,13 @@ void checkTempThresholds() {
 }
 
 void detectHeatingCycle() {
-  if (g_tempHistCount < 30) return;  // Need at least 5 minutes of data
+  // Readings in 5 minutes at the configured interval (the buffer holds 60)
+  int window = constrain(300 / max((int)g_cfg.tempReadInterval, 1), 1, 59);
+  if (g_tempHistCount <= window) return;  // Need at least 5 minutes of data
 
-  // Calculate temperature rise over last 5 minutes (30 readings at 10s)
-  int oldest = (g_tempHistIdx - 30 + 60) % 60;
+  // Calculate temperature rise over the last 5 minutes. The newest reading is at
+  // g_tempHistIdx - 1, so this is `window` readings before it.
+  int oldest = (g_tempHistIdx - 1 - window + 60) % 60;
   float tempRise = g_currentTempF - g_tempHistory2Min[oldest];
 
   if (!g_burnerActive) {
@@ -1446,7 +1647,7 @@ void detectHeatingCycle() {
       // Record cycle
       HeatingCycle cycle;
       struct tm timeinfo;
-      if (getLocalTime(&timeinfo, 0)) {
+      if (localNow(&timeinfo)) {
         cycle.startTime = mktime(&timeinfo) - (millis() - g_cycleStartTime) / 1000;
       } else {
         cycle.startTime = (millis() - g_cycleStartTime) / 1000;  // Relative
@@ -1460,6 +1661,7 @@ void detectHeatingCycle() {
       g_cycles[g_cycleHead] = cycle;
       g_cycleHead = (g_cycleHead + 1) % MAX_CYCLES;
       if (g_cycleCount < MAX_CYCLES) g_cycleCount++;
+      g_lastCycleEndMs = millis();
 
       // Update hourly bucket
       updateHourlyBucket(cycle.durationSec);
@@ -1472,17 +1674,23 @@ void detectHeatingCycle() {
   }
 }
 
-void updateHourlyBucket(uint32_t durationSec) {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 0)) return;
-
-  uint8_t hour = timeinfo.tm_hour;
-  if (hour != g_lastRecordedHour) {
-    // New hour — advance bucket
+// Keep the head bucket on the current hour. It used to advance one bucket per
+// cycle whatever the time gap, so the "24h" chart was really the last 24 cycles.
+void advanceHourlyBuckets() {
+  if (!timeIsSynced()) return;
+  uint32_t hour = (uint32_t)time(nullptr) / 3600;
+  if (g_hourlyEpochHour == 0) g_hourlyEpochHour = hour;
+  uint32_t steps = min(hour - g_hourlyEpochHour, (uint32_t)HOURLY_BUCKETS);
+  for (uint32_t i = 0; i < steps; i++) {
     g_hourlyHead = (g_hourlyHead + 1) % HOURLY_BUCKETS;
     g_hourlyHeatMin[g_hourlyHead] = 0;
-    g_lastRecordedHour = hour;
   }
+  g_hourlyEpochHour = hour;
+}
+
+void updateHourlyBucket(uint32_t durationSec) {
+  if (!timeIsSynced()) return;
+  advanceHourlyBuckets();
   g_hourlyHeatMin[g_hourlyHead] += durationSec / 60.0;
 }
 
@@ -1492,7 +1700,7 @@ void getCyclesToday(int& count, uint32_t& totalSec) {
   totalSec = 0;
 
   struct tm now;
-  if (!getLocalTime(&now, 0)) return;
+  if (!localNow(&now)) return;
 
   // Start of today
   struct tm todayStart = now;
@@ -1606,7 +1814,7 @@ void drawScreenStatus() {
   g_sprite.drawString("Last Cycle:", 10, 136, 2);
   if (g_cycleCount > 0) {
     int lastIdx = (g_cycleHead - 1 + MAX_CYCLES) % MAX_CYCLES;
-    unsigned long ago = (millis() - g_bootTime) / 1000;  // Simplified
+    unsigned long ago = (millis() - g_lastCycleEndMs) / 1000;
     uint32_t cycleDur = g_cycles[lastIdx].durationSec;
     char agoStr[32];
     if (ago < 3600) {
@@ -1666,7 +1874,7 @@ void drawScreenCycles() {
 
   int barWidth = 12;
   int barGap = 1;
-  int chartX = 10;
+  int chartX = 4;   // 24 bars at 13 px = 312 px of the 320
   int chartBottom = 148;
   int chartHeight = 40;
 
@@ -1677,7 +1885,7 @@ void drawScreenCycles() {
     if (g_hourlyHeatMin[idx] > maxMin) maxMin = g_hourlyHeatMin[idx];
   }
 
-  // Draw bars (most recent 24 hours, right to left)
+  // Draw bars (oldest on the left, current hour on the right)
   for (int i = 0; i < 24; i++) {
     int idx = (g_hourlyHead - (23 - i) + HOURLY_BUCKETS) % HOURLY_BUCKETS;
     float val = g_hourlyHeatMin[idx];
@@ -1698,8 +1906,10 @@ void drawScreenCycles() {
 
   // Time labels
   g_sprite.setTextSize(1);
+  g_sprite.setTextDatum(TL_DATUM);
   g_sprite.drawString("24h ago", chartX, chartBottom + 4, 1);
-  g_sprite.drawString("Now", chartX + 23 * (barWidth + barGap), chartBottom + 4, 1);
+  g_sprite.setTextDatum(TR_DATUM);
+  g_sprite.drawString("Now", chartX + 24 * (barWidth + barGap), chartBottom + 4, 1);
 
   g_sprite.pushSprite(0, 0);
 }
@@ -1741,12 +1951,15 @@ void drawScreenTempGraph() {
   // Y-axis labels
   g_sprite.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   g_sprite.setTextDatum(MR_DATUM);
+  // History is stored in F; the axis follows the unit setting
   char lbl[8];
-  snprintf(lbl, sizeof(lbl), "%.0f", maxT);
+  float axisTop = g_cfg.useFahrenheit ? maxT : (maxT - 32) * 5 / 9;
+  float axisBot = g_cfg.useFahrenheit ? minT : (minT - 32) * 5 / 9;
+  snprintf(lbl, sizeof(lbl), "%.0f", axisTop);
   g_sprite.drawString(lbl, gx - 4, gy, 1);
-  snprintf(lbl, sizeof(lbl), "%.0f", (maxT + minT) / 2);
+  snprintf(lbl, sizeof(lbl), "%.0f", (axisTop + axisBot) / 2);
   g_sprite.drawString(lbl, gx - 4, gy + gh / 2, 1);
-  snprintf(lbl, sizeof(lbl), "%.0f", minT);
+  snprintf(lbl, sizeof(lbl), "%.0f", axisBot);
   g_sprite.drawString(lbl, gx - 4, gy + gh, 1);
 
   // Draw graph border
@@ -1786,12 +1999,13 @@ void drawScreenHotWater() {
 
   // "Hot Water" on top half — white, large
   g_sprite.setTextColor(TFT_WHITE, TFT_BLACK);
-  g_sprite.drawString("Hot Water", 160, 50, 4);
+  g_sprite.drawString(g_tslFault ? "Light Sensor Fault" : "Hot Water", 160, 50, 4);
 
   // ON or OFF — fills bottom half, bold
   bool on = (g_confirmedFlashCode == 1);
-  uint16_t stateColor = on ? TFT_GREEN : TFT_RED;
-  const char* stateText = on ? "ON" : "OFF";
+  bool unknown = (g_confirmedFlashCode == -1);   // Still detecting, or can't see the LED
+  uint16_t stateColor = unknown ? TFT_DARKGREY : on ? TFT_GREEN : TFT_RED;
+  const char* stateText = unknown ? "?" : on ? "ON" : "OFF";
 
   g_sprite.setTextColor(stateColor, TFT_BLACK);
   g_sprite.setTextSize(3);
@@ -1876,13 +2090,7 @@ void updateDisplay() {
     // Cycle through other screens on timer while in manual mode
     if (g_cfg.screenRotationSec > 0 &&
         now - g_lastScreenChange >= (uint32_t)g_cfg.screenRotationSec * 1000) {
-      for (int i = 1; i <= SCREEN_COUNT; i++) {
-        int next = (g_currentScreen + i) % SCREEN_COUNT;
-        if (g_cfg.screensEnabled[next]) {
-          g_currentScreen = next;
-          break;
-        }
-      }
+      g_currentScreen = nextEnabledScreen(g_currentScreen, 1);
       g_lastScreenChange = now;
     }
     // Return to default screen after 30 seconds of no button press
@@ -1892,6 +2100,8 @@ void updateDisplay() {
       g_lastScreenChange = now;
     }
   }
+
+  if (g_screenOff) return;   // Nothing to see; 5 fps of full-screen pushes for no one
 
   // Show error screen only if the light sensor is missing (primary sensor)
   // DS18B20 absence is handled gracefully — screens show N/A for temp data
@@ -1946,7 +2156,6 @@ unsigned long g_moLastMotion = 0;         // millis of the last above-threshold 
 bool g_moMotion = false;
 uint32_t g_moPktsThisSec = 0, g_moPktRate = 0;
 int8_t g_moRssi = 0;
-volatile bool g_moSavePending = false;    // set from web handlers, saved by loop()
 volatile bool g_otaActive = false;        // pause sensing while ElegantOTA uploads
 
 static void moCsiCallback(void*, wifi_csi_info_t* info) {
@@ -1972,6 +2181,7 @@ void moResetWindow() {
 // Use the threshold saved for the AP we're on, or auto-set one for it
 void moUseApThreshold() {
   String b = WiFi.BSSIDstr();
+  if (b.length() == 0) return;
   if (g_cfg.motionThresh > 0 && b == g_cfg.motionBssid) return;
   char key[16];
   apThreshKey(b.c_str(), key);
@@ -1994,9 +2204,12 @@ void motionStart() {
   if (!g_moRing) g_moRing = (MoPkt*)malloc(sizeof(MoPkt) * MO_RING);
   if (!g_moWin)  g_moWin = (float (*)[MO_SC])malloc(sizeof(float) * MO_SC * MO_WIN);
   if (!g_moRing || !g_moWin) { addLog("Motion: buffer alloc failed"); return; }
+  // WiFi.BSSID() returns NULL the moment the station isn't associated
+  const uint8_t* apBssid = WiFi.BSSID();
+  if (!apBssid) return;
   moResetWindow();
   g_moTail = g_moHead;
-  memcpy(g_moBssid, WiFi.BSSID(), 6);
+  memcpy(g_moBssid, apBssid, 6);
   wifi_csi_config_t cfg = {};
   cfg.lltf_en = true;
   cfg.ltf_merge_en = true;
@@ -2149,8 +2362,9 @@ void motionTick() {
     g_moPktsThisSec = 0;
     // Roamed or re-associated to another AP: new baseline, and that AP's
     // threshold (or a fresh auto-set)
-    if (memcmp(g_moBssid, WiFi.BSSID(), 6) != 0) {
-      memcpy(g_moBssid, WiFi.BSSID(), 6);
+    const uint8_t* apBssid = WiFi.BSSID();
+    if (apBssid && memcmp(g_moBssid, apBssid, 6) != 0) {
+      memcpy(g_moBssid, apBssid, 6);
       moResetWindow();
       char msg[64];
       snprintf(msg, sizeof(msg), "Motion: AP changed -> %s", WiFi.BSSIDstr().c_str());
@@ -2184,7 +2398,7 @@ void updateBacklight() {
   uint8_t targetBright = g_cfg.brightness;
 
   struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 0)) {
+  if (localNow(&timeinfo)) {
     uint8_t hour = timeinfo.tm_hour;
     bool dimTime;
     if (g_cfg.dimStartHour > g_cfg.dimEndHour) {
@@ -2227,6 +2441,15 @@ void updateBacklight() {
 /*******************************************************************************
  * BUTTON HANDLING
  ******************************************************************************/
+// The next enabled screen stepping by `step` (1 = forward, SCREEN_COUNT-1 = back)
+int nextEnabledScreen(int from, int step) {
+  for (int i = 1; i <= SCREEN_COUNT; i++) {
+    int next = (from + i * step) % SCREEN_COUNT;
+    if (g_cfg.screensEnabled[next]) return next;
+  }
+  return from;
+}
+
 void processButtons() {
   bool btn1 = (digitalRead(PIN_BUTTON_1) == LOW);
   bool btn2 = (digitalRead(PIN_BUTTON_2) == LOW);
@@ -2244,7 +2467,7 @@ void processButtons() {
   if (btn1 && !g_btn1Pressed) {
     g_manualScreenNav = true;
     g_lastButtonPress = millis();
-    g_currentScreen = (g_currentScreen - 1 + SCREEN_COUNT) % SCREEN_COUNT;
+    g_currentScreen = nextEnabledScreen(g_currentScreen, SCREEN_COUNT - 1);
     g_lastScreenChange = millis();
   }
 
@@ -2252,7 +2475,7 @@ void processButtons() {
   if (btn2 && !g_btn2Pressed) {
     g_manualScreenNav = true;
     g_lastButtonPress = millis();
-    g_currentScreen = (g_currentScreen + 1) % SCREEN_COUNT;
+    g_currentScreen = nextEnabledScreen(g_currentScreen, 1);
     g_lastScreenChange = millis();
   }
 
@@ -2268,7 +2491,10 @@ void pushToHomeAssistant() {
   if (strlen(g_cfg.haURL) == 0 || strlen(g_cfg.haToken) == 0) return;
 
   unsigned long now = millis();
-  bool shouldPush = (now - g_lastHAPush >= HA_PUSH_INTERVAL_MS) || g_haStatusChanged;
+  // Changes go out promptly but not back to back: a burst of events on a bad link
+  // otherwise chains blocking pushes and leaves no time to watch the LED.
+  bool shouldPush = (now - g_lastHAPush >= HA_PUSH_INTERVAL_MS) ||
+                    (g_haStatusChanged && now - g_lastHAPush >= HA_PUSH_MIN_GAP_MS);
   if (!shouldPush) return;
 
   g_lastHAPush = now;
@@ -2276,41 +2502,42 @@ void pushToHomeAssistant() {
 
   // Use HTTPClient for HA REST API
   // Each entity gets POSTed to /api/states/<entity_id>
-  // Small delays between calls to avoid overwhelming ESP32 WiFi stack
-  pushHAEntity("sensor", "status", getFlashCodeInfo(g_confirmedFlashCode) ? getFlashCodeInfo(g_confirmedFlashCode)->text : "Unknown", "");
+  // Small delays between calls to avoid overwhelming ESP32 WiFi stack.
+  // The first request that can't reach HA ends the round: the rest would each
+  // burn their own timeout, and the next round is only 30 s away.
+  if (!pushHAEntity("sensor", "status", getFlashCodeInfo(g_confirmedFlashCode) ? getFlashCodeInfo(g_confirmedFlashCode)->text : "Unknown", "")) return;
   delay(100);
 
   char valBuf[16];
   snprintf(valBuf, sizeof(valBuf), "%d", g_confirmedFlashCode);
-  pushHAEntity("sensor", "flash_code", valBuf, "");
+  if (!pushHAEntity("sensor", "flash_code", valBuf, "")) return;
   delay(100);
 
   // Push pilot_out binary sensor for HomeKit integration
-  pushHAEntity("binary_sensor", "pilot_out",
-    g_confirmedFlashCode != 1 ? "on" : "off", "problem");
+  // Unknown (-1, right after every boot) is not a problem report
+  if (!pushHAEntity("binary_sensor", "pilot_out",
+    g_confirmedFlashCode >= 0 && g_confirmedFlashCode != 1 ? "on" : "off", "problem")) return;
 
   // Only push temperature-related entities if DS18B20 is connected
   if (g_ds18b20Found) {
     if (!isnan(g_currentTempF)) {
       snprintf(valBuf, sizeof(valBuf), "%.1f", g_cfg.useFahrenheit ? g_currentTempF : g_currentTempC);
-      pushHAEntity("sensor", "temperature", valBuf, g_cfg.useFahrenheit ? "°F" : "°C");
+      if (!pushHAEntity("sensor", "temperature", valBuf, g_cfg.useFahrenheit ? "°F" : "°C")) return;
     }
 
-    pushHAEntity("binary_sensor", "burner", g_burnerActive ? "on" : "off", "");
+    if (!pushHAEntity("binary_sensor", "burner", g_burnerActive ? "on" : "off", "")) return;
 
     int ct; uint32_t ts;
     getCyclesToday(ct, ts);
     snprintf(valBuf, sizeof(valBuf), "%d", ct);
-    pushHAEntity("sensor", "cycles_today", valBuf, "");
+    if (!pushHAEntity("sensor", "cycles_today", valBuf, "")) return;
 
     snprintf(valBuf, sizeof(valBuf), "%lu", ts / 60);
-    pushHAEntity("sensor", "daily_heat_time", valBuf, "min");
+    if (!pushHAEntity("sensor", "daily_heat_time", valBuf, "min")) return;
   }
 
-  if (g_haEventPending) {
-    g_haEventPending = false;
-    pushHAEvent();
-  }
+  // Stays pending until HA has actually been reached
+  if (g_haEventPending && pushHAEvent()) g_haEventPending = false;
 }
 
 // Fire a Home Assistant event so automations can trigger on the occurrence
@@ -2320,7 +2547,7 @@ void pushToHomeAssistant() {
 //   trigger:
 //     - platform: event
 //       event_type: water_heater_alert
-void pushHAEvent() {
+bool pushHAEvent() {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/events/water_heater_alert", g_cfg.haURL);
 
@@ -2357,9 +2584,11 @@ void pushHAEvent() {
     addLog(msg);  // addLog, not logEvent — a failed push must not loop back
   }
   http.end();
+  return httpCode > 0;
 }
 
-void pushHAEntity(const char* domain, const char* name, const char* state, const char* unit) {
+// True if the request reached HA, whatever HA answered
+bool pushHAEntity(const char* domain, const char* name, const char* state, const char* unit) {
   // Build entity_id
   char entityId[128];
   snprintf(entityId, sizeof(entityId), "%s.%s_%s", domain, g_cfg.haEntityPrefix, name);
@@ -2407,6 +2636,7 @@ void pushHAEntity(const char* domain, const char* name, const char* state, const
     addLog(msg);
   }
   http.end();
+  return httpCode > 0;
 }
 
 /*******************************************************************************
@@ -2457,6 +2687,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <div id="chartsContainer"></div>
 
 <form id="configForm" method="POST" action="/config">
+<input type="hidden" name="fullForm" value="1">
 
 <h2>WiFi Settings</h2>
 <label>SSID</label>
@@ -2611,7 +2842,7 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
   <div>
     <label>Display Off Without Motion</label>
     <select name="moMode">
-      <option value="1" %MO1%>Enabled</option>
+      <option value="1" %MO1%>Enabled (may cause reboots)</option>
       <option value="0" %MO0%>Disabled (always on)</option>
     </select>
   </div>
@@ -2669,6 +2900,8 @@ const char CONFIG_HTML[] PROGMEM = R"rawliteral(
 <script>
 var calibrate=function(){
   fetch('/api/calibrate',{method:'POST'})
+    .then(function(){return new Promise(function(ok){setTimeout(ok,3000);});})
+    .then(function(){return fetch('/api/calibrate');})
     .then(function(r){return r.json();})
     .then(function(d){
       document.getElementById('lightBase').value=d.baseline;
@@ -3056,8 +3289,18 @@ setInterval(load, 30000);
 </html>
 )rawliteral";
 
+// Saved settings go into HTML attribute values
+String htmlEsc(const char* in) {
+  String out(in);
+  out.replace("&", "&amp;");
+  out.replace("\"", "&quot;");
+  out.replace("<", "&lt;");
+  out.replace(">", "&gt;");
+  return out;
+}
+
 String templateProcessor(const String& var) {
-  if (var == "WIFI_SSID")    return g_cfg.wifiSSID;
+  if (var == "WIFI_SSID")    return htmlEsc(g_cfg.wifiSSID);
   if (var == "WIFI_PASS")    return strlen(g_cfg.wifiPassword) ? SECRET_SENTINEL : "";
   if (var == "LIGHT_THRESH") return String(g_cfg.lightThreshold);
   if (var == "LIGHT_BASE")   return String(g_cfg.lightBaseline);
@@ -3071,17 +3314,17 @@ String templateProcessor(const String& var) {
   if (var == "HIGH_TEMP")    return String(g_cfg.highTempWarning, 0);
   if (var == "CRIT_TEMP")    return String(g_cfg.criticalTemp, 0);
   if (var == "HA_EN")        return g_cfg.haEnabled ? "checked" : "";
-  if (var == "HA_URL")       return g_cfg.haURL;
+  if (var == "HA_URL")       return htmlEsc(g_cfg.haURL);
   if (var == "HA_TOKEN")     return strlen(g_cfg.haToken) ? SECRET_SENTINEL : "";
-  if (var == "HA_PREFIX")    return g_cfg.haEntityPrefix;
-  if (var == "TZ")           return g_cfg.tzString;
-  if (var == "NTP")          return g_cfg.ntpServer;
+  if (var == "HA_PREFIX")    return htmlEsc(g_cfg.haEntityPrefix);
+  if (var == "TZ")           return htmlEsc(g_cfg.tzString);
+  if (var == "NTP")          return htmlEsc(g_cfg.ntpServer);
   if (var == "EVT_EN")       return g_cfg.eventLogEnabled ? "checked" : "";
   if (var == "SYS_EN")       return g_cfg.syslogEnabled ? "checked" : "";
-  if (var == "SYS_HOST")     return g_cfg.syslogHost;
+  if (var == "SYS_HOST")     return htmlEsc(g_cfg.syslogHost);
   if (var == "SYS_PORT")     return String(g_cfg.syslogPort);
   if (var == "HB_MIN")       return String(g_cfg.heartbeatMin);
-  if (var == "PROBE_HOST")   return g_cfg.probeHost;
+  if (var == "PROBE_HOST")   return htmlEsc(g_cfg.probeHost);
   if (var == "PROBE_PORT")   return String(g_cfg.probePort);
   if (var == "LNK_RBT")      return String(g_cfg.linkRebootMin);
   if (var == "SCR_ROT")      return String(g_cfg.screenRotationSec);
@@ -3122,16 +3365,19 @@ void setupWebServer() {
     if (request->hasParam("lightThresh", true))
       g_cfg.lightThreshold = request->getParam("lightThresh", true)->value().toInt();
     if (request->hasParam("lightGain", true))
-      g_cfg.lightGain = request->getParam("lightGain", true)->value().toInt();
+      g_cfg.lightGain = constrain(request->getParam("lightGain", true)->value().toInt(), 1, 4);
     if (request->hasParam("tempInt", true))
-      g_cfg.tempReadInterval = request->getParam("tempInt", true)->value().toInt();
+      g_cfg.tempReadInterval = constrain(request->getParam("tempInt", true)->value().toInt(), 5, 3600);
     if (request->hasParam("useF", true))
       g_cfg.useFahrenheit = request->getParam("useF", true)->value().toInt() == 1;
     if (request->hasParam("highTempWarn", true))
       g_cfg.highTempWarning = request->getParam("highTempWarn", true)->value().toFloat();
     if (request->hasParam("critTemp", true))
       g_cfg.criticalTemp = request->getParam("critTemp", true)->value().toFloat();
-    g_cfg.haEnabled = request->hasParam("haEnabled", true);
+    // An unticked checkbox simply isn't sent, so only the real form may clear one.
+    // A partial POST (curl, a script) used to switch off HA and the event log.
+    const bool fullForm = request->hasParam("fullForm", true);
+    if (fullForm) g_cfg.haEnabled = request->hasParam("haEnabled", true);
     if (request->hasParam("haURL", true))
       strlcpy(g_cfg.haURL, request->getParam("haURL", true)->value().c_str(), sizeof(g_cfg.haURL));
     if (request->hasParam("haToken", true)) {
@@ -3145,8 +3391,10 @@ void setupWebServer() {
       strlcpy(g_cfg.tzString, request->getParam("tz", true)->value().c_str(), sizeof(g_cfg.tzString));
     if (request->hasParam("ntp", true))
       strlcpy(g_cfg.ntpServer, request->getParam("ntp", true)->value().c_str(), sizeof(g_cfg.ntpServer));
-    g_cfg.eventLogEnabled = request->hasParam("evtEn", true);
-    g_cfg.syslogEnabled   = request->hasParam("sysEn", true);
+    if (fullForm) {
+      g_cfg.eventLogEnabled = request->hasParam("evtEn", true);
+      g_cfg.syslogEnabled   = request->hasParam("sysEn", true);
+    }
     if (request->hasParam("sysHost", true))
       strlcpy(g_cfg.syslogHost, request->getParam("sysHost", true)->value().c_str(), sizeof(g_cfg.syslogHost));
     if (request->hasParam("sysPort", true))
@@ -3160,31 +3408,32 @@ void setupWebServer() {
     if (request->hasParam("lnkRbtMin", true))
       g_cfg.linkRebootMin = request->getParam("lnkRbtMin", true)->value().toInt();
     if (request->hasParam("scrRotSec", true))
-      g_cfg.screenRotationSec = request->getParam("scrRotSec", true)->value().toInt();
-    g_cfg.screensEnabled[0] = request->hasParam("scrEn0", true);
-    g_cfg.screensEnabled[1] = request->hasParam("scrEn1", true);
-    g_cfg.screensEnabled[2] = request->hasParam("scrEn2", true);
-    g_cfg.screensEnabled[3] = request->hasParam("scrEn3", true);
+      g_cfg.screenRotationSec = constrain(request->getParam("scrRotSec", true)->value().toInt(), 0, 255);
+    if (fullForm) {
+      g_cfg.screensEnabled[0] = request->hasParam("scrEn0", true);
+      g_cfg.screensEnabled[1] = request->hasParam("scrEn1", true);
+      g_cfg.screensEnabled[2] = request->hasParam("scrEn2", true);
+      g_cfg.screensEnabled[3] = request->hasParam("scrEn3", true);
+    }
     if (request->hasParam("bright", true))
-      g_cfg.brightness = request->getParam("bright", true)->value().toInt();
+      g_cfg.brightness = constrain(request->getParam("bright", true)->value().toInt(), 0, 255);
     if (request->hasParam("dimBright", true))
-      g_cfg.dimBrightness = request->getParam("dimBright", true)->value().toInt();
+      g_cfg.dimBrightness = constrain(request->getParam("dimBright", true)->value().toInt(), 0, 255);
     if (request->hasParam("dimStart", true))
-      g_cfg.dimStartHour = request->getParam("dimStart", true)->value().toInt();
+      g_cfg.dimStartHour = constrain(request->getParam("dimStart", true)->value().toInt(), 0, 23);
     if (request->hasParam("dimEnd", true))
-      g_cfg.dimEndHour = request->getParam("dimEnd", true)->value().toInt();
+      g_cfg.dimEndHour = constrain(request->getParam("dimEnd", true)->value().toInt(), 0, 23);
     if (request->hasParam("moMode", true))
       g_cfg.motionMode = request->getParam("moMode", true)->value().toInt() ? 1 : 0;
     if (request->hasParam("moOffMin", true))
       g_cfg.motionOffMin = constrain(request->getParam("moOffMin", true)->value().toInt(), 1, 120);
 
-    saveConfig();
-
     request->send(200, "text/html", "<html><body style='background:#1a1a2e;color:#fff;text-align:center;padding:40px;font-family:sans-serif;'>"
                   "<h2>Settings Saved!</h2><p>Rebooting in 3 seconds...</p></body></html>");
 
-    delay(3000);
-    ESP.restart();
+    // loop() saves, then restarts once the response has gone out
+    g_moSavePending = true;
+    g_restartAt = millis() + 3000;
   });
 
   // API: Status
@@ -3220,7 +3469,7 @@ void setupWebServer() {
     doc["uptime_sec"] = (millis() - g_bootTime) / 1000;
     doc["wifi_rssi"] = g_wifiConnected ? WiFi.RSSI() : 0;
     doc["free_heap"] = ESP.getFreeHeap();
-    doc["light_sensor_als_raw"] = g_lastLightHigh ? g_lightPeak : 0;
+    doc["light_sensor_als_raw"] = g_lastReading;
     doc["light_sensor_baseline"] = g_lightBaseline;
     doc["screen_off"] = g_screenOff;
     doc["motion_state"] = motionStateName();
@@ -3269,6 +3518,13 @@ void setupWebServer() {
   g_server.on("/api/debug", HTTP_GET, [](AsyncWebServerRequest* request) {
     JsonDocument doc;
 
+    doc["fw_version"] = FW_VERSION;
+    doc["sketch_md5"] = ESP.getSketchMD5();
+    doc["app_state"] = appStateName();
+    doc["last_crash"] = g_lastCrash;
+    doc["prev_stage"] = g_prevValid ? STAGE_NAMES[g_prevStage] : "";
+    doc["prev_uptime_sec"] = g_prevValid ? g_prevUptimeSec : 0;
+    doc["tsl_fault"] = g_tslFault;
     doc["free_heap"] = ESP.getFreeHeap();
     doc["free_psram"] = ESP.getFreePsram();
     doc["chip_model"] = ESP.getChipModel();
@@ -3286,7 +3542,7 @@ void setupWebServer() {
     lk["associated"] = (WiFi.status() == WL_CONNECTED);
     lk["bssid"] = g_wifiConnected ? WiFi.BSSIDstr() : "N/A";
     lk["reachable"] = (g_linkUnreachableSince == 0);
-    lk["sec_since_proven_ok"] = g_lastNetOkMs ? (millis() - g_lastNetOkMs) / 1000 : -1;
+    lk["sec_since_proven_ok"] = g_lastNetOkMs ? (long)((millis() - g_lastNetOkMs) / 1000) : -1L;
     lk["unreachable_sec"] = g_linkUnreachableSince ? (millis() - g_linkUnreachableSince) / 1000 : 0;
     lk["consecutive_probe_failures"] = g_linkFailCount;
     lk["probe_failures_total"] = g_linkProbeFailures;
@@ -3337,7 +3593,7 @@ void setupWebServer() {
     sl["host"] = g_cfg.syslogHost;
     sl["port"] = g_cfg.syslogPort;
     sl["heartbeat_min"] = g_cfg.heartbeatMin;
-    sl["heartbeat_age_sec"] = g_lastHeartbeat ? (millis() - g_lastHeartbeat) / 1000 : -1;
+    sl["heartbeat_age_sec"] = g_lastHeartbeat ? (long)((millis() - g_lastHeartbeat) / 1000) : -1L;
 
     JsonObject tm = doc["time"].to<JsonObject>();
     tm["tz"] = g_cfg.tzString;
@@ -3347,7 +3603,7 @@ void setupWebServer() {
     {
       struct tm ti;
       char buf[32] = "unsynced";
-      if (getLocalTime(&ti, 0)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
+      if (localNow(&ti)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &ti);
       tm["local"] = buf;
     }
     tm["reset_reason"] = resetReasonText();
@@ -3370,20 +3626,32 @@ void setupWebServer() {
     doc["cycle_count"] = g_cycleCount;
     doc["temp_graph_count"] = g_tempGraphCount;
 
-    // I2C scan
+    // I2C devices found at boot
     JsonArray i2c = doc["i2c_devices"].to<JsonArray>();
-    for (uint8_t addr = 1; addr < 127; addr++) {
-      Wire.beginTransmission(addr);
-      if (Wire.endTransmission() == 0) {
-        char addrStr[8];
-        snprintf(addrStr, sizeof(addrStr), "0x%02X", addr);
-        i2c.add(addrStr);
-      }
+    for (int i = 0; i < g_i2cFoundCount; i++) {
+      char addrStr[8];
+      snprintf(addrStr, sizeof(addrStr), "0x%02X", g_i2cFound[i]);
+      i2c.add(addrStr);
     }
 
     String json;
     serializeJson(doc, json);
     request->send(200, "application/json", json);
+  });
+
+  // GET /api/coredump — the raw crash dump, for esp-coredump + the crashed build's .elf.
+  // Left in flash so it can still be fetched; the next crash overwrites it.
+  g_server.on("/api/coredump", HTTP_GET, [](AsyncWebServerRequest *request) {
+    size_t addr = 0, size = 0;
+    if (esp_core_dump_image_get(&addr, &size) != ESP_OK) {
+      request->send(404, "application/json", "{\"error\":\"no crash dump\"}");
+      return;
+    }
+    request->send(request->beginResponse("application/octet-stream", size,
+      [addr, size](uint8_t *buf, size_t maxLen, size_t index) -> size_t {
+        size_t n = min(maxLen, size - index);
+        return esp_flash_read(esp_flash_default_chip, buf, addr + index, n) == ESP_OK ? n : 0;
+      }));
   });
 
   // API: Log
@@ -3463,14 +3731,8 @@ void setupWebServer() {
       request->send(500, "application/json", "{\"error\":\"FFat not mounted\"}");
       return;
     }
-    if (FFat.exists(EVENT_LOG_PATH))      FFat.remove(EVENT_LOG_PATH);
-    if (FFat.exists(EVENT_LOG_PREV_PATH)) FFat.remove(EVENT_LOG_PREV_PATH);
-    g_eventCount = 0;
+    g_clearLogRequested = true;   // loop() may be appending right now
     request->send(200, "application/json", "{\"ok\":true}");
-    // addLog + syslog rather than logEvent: this runs in the AsyncTCP task, and
-    // writing to FFat from there while loop() may be appending is worth avoiding.
-    addLog("Event log cleared via web UI");
-    sendSyslog(EV_INFO, "system", "Event log cleared via web UI");
   });
 
   // API: Format the FFat partition. Explicit and user-triggered — the format
@@ -3492,11 +3754,7 @@ void setupWebServer() {
       request->send(400, "application/json", "{\"error\":\"syslog not configured\"}");
       return;
     }
-    sendSyslog(EV_INFO, "test", "Syslog test message from water heater monitor");
-    // Also emit a real heartbeat, so the exact line the collector will see on
-    // an ongoing basis can be verified now rather than after waiting an interval
-    g_lastHeartbeat = 0;
-    sendHeartbeat();
+    g_syslogTestRequested = true;
     JsonDocument doc;
     doc["sent"] = true;
     doc["host"] = g_cfg.syslogHost;
@@ -3513,32 +3771,18 @@ void setupWebServer() {
       return;
     }
 
-    // Read current ambient level (average 10 samples)
-    uint32_t total = 0;
-    for (int i = 0; i < 10; i++) {
-      uint32_t lum = g_tsl.getFullLuminosity();
-      uint16_t full = lum & 0xFFFF;
-      total += full;
-      delay(50);
-    }
-    uint16_t avg = total / 10;
+    // Ambient level from the next 10 samples; loop() owns the sensor. GET for the result.
+    g_calibrateRequested = true;
+    request->send(202, "application/json", "{\"started\":true}");
+  });
 
-    g_cfg.lightBaseline = avg;
-    g_cfg.lightThreshold = avg * 2 + 50;
-    g_lightBaseline = avg;
-    saveConfig();
-
+  g_server.on("/api/calibrate", HTTP_GET, [](AsyncWebServerRequest* request) {
     JsonDocument doc;
     doc["baseline"] = g_cfg.lightBaseline;
     doc["threshold"] = g_cfg.lightThreshold;
-
+    doc["running"] = g_calibrateRequested || g_calibRemaining > 0;
     String json;
     serializeJson(doc, json);
-
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Calibrated: baseline=%u threshold=%u", g_cfg.lightBaseline, g_cfg.lightThreshold);
-    addLog(msg);
-
     request->send(200, "application/json", json);
   });
 
@@ -3600,12 +3844,123 @@ void setupWebServer() {
 }
 
 /*******************************************************************************
+ * OTA SAFETY NET + CRASH REPORTING (rollback as on the 7-inch dashboard)
+ *
+ * A freshly OTA'd app stays "pending verify" until it has run healthy for
+ * APP_SETTLE_MS. A crash, a hang (5 s loop watchdog while pending) or no health
+ * by APP_PROVE_MS makes the bootloader return to the previous firmware.
+ ******************************************************************************/
+extern "C" bool verifyRollbackLater() { return true; }
+#define APP_SETTLE_MS  60000
+#define APP_PROVE_MS  180000
+bool g_appPending = false;
+const char* appStateName() { return g_appPending ? "pending" : "valid"; }
+
+void appHealthInit() {
+  esp_ota_img_states_t st;
+  if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+    g_appPending = true;
+    Serial.println("OTA: new firmware on probation");
+  }
+}
+
+void appHealthCheck() {
+  if (!g_appPending) return;
+  static bool armed = false;
+  if (!armed) { armed = true; enableLoopWDT(); }
+  unsigned long now = millis();
+  bool healthy = WiFi.status() == WL_CONNECTED && (g_lastSampleDone != 0 || !g_tslFound);
+  if (healthy && now >= APP_SETTLE_MS) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    g_appPending = false;
+    disableLoopWDT();
+    logEvent(EV_INFO, "boot", "OTA: firmware v" FW_VERSION " healthy, marked valid");
+  } else if (now >= APP_PROVE_MS) {
+    logEvent(EV_ERROR, "boot", "OTA: firmware failed its health check, rolling back");
+    delay(200);
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
+}
+
+// Say why the last run ended. Decode PCs with:
+//   xtensa-esp32s3-elf-addr2line -pfiaC -e water_heater_monitor.ino.elf <pc> ...
+// using the .elf of the firmware that crashed. Dumps come from panics; a watchdog
+// reset with no dump still has the breadcrumb.
+void reportPreviousRun() {
+  esp_reset_reason_t why = esp_reset_reason();
+  if (why != ESP_RST_POWERON && why != ESP_RST_SW && g_prevValid) {
+    logEvent(EV_INFO, "boot", "Previous run: raw reset %d, in %s, up %lus",
+             (int)esp_rom_get_reset_reason(0), STAGE_NAMES[g_prevStage], (unsigned long)g_prevUptimeSec);
+  }
+  if (esp_core_dump_image_check() != ESP_OK) return;
+  static esp_core_dump_summary_t sum;
+  if (esp_core_dump_get_summary(&sum) != ESP_OK) return;
+  int n = snprintf(g_lastCrash, sizeof(g_lastCrash), "Crash: %s cause %lu addr %lx epc1 %lx pc %lx bt",
+                   sum.exc_task, (unsigned long)sum.ex_info.exc_cause, (unsigned long)sum.ex_info.exc_vaddr,
+                   (unsigned long)sum.ex_info.epcx[0], (unsigned long)sum.exc_pc);
+  for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 4 && n < (int)sizeof(g_lastCrash) - 12; i++) {
+    n += snprintf(g_lastCrash + n, sizeof(g_lastCrash) - n, " %lx", (unsigned long)sum.exc_bt_info.bt[i]);
+  }
+  // The dump stays in flash for /api/coredump, so log each one once
+  uint32_t id = sum.exc_pc ^ sum.exc_bt_info.bt[1] ^ sum.ex_info.exc_a[1];
+  if (id != g_rtcCrashLogged) {
+    g_rtcCrashLogged = id;
+    logEvent(EV_WARNING, "boot", "%s", g_lastCrash);
+  }
+}
+
+// Work web handlers can't safely do themselves (see g_restartAt)
+void processWebRequests() {
+  if (g_clearLogRequested) {
+    g_clearLogRequested = false;
+    if (g_ffatMounted) {
+      if (FFat.exists(EVENT_LOG_PATH))      FFat.remove(EVENT_LOG_PATH);
+      if (FFat.exists(EVENT_LOG_PREV_PATH)) FFat.remove(EVENT_LOG_PREV_PATH);
+      g_eventCount = 0;
+      addLog("Event log cleared via web UI");
+      sendSyslog(EV_INFO, "system", "Event log cleared via web UI");
+    }
+  }
+  if (g_syslogTestRequested) {
+    g_syslogTestRequested = false;
+    sendSyslog(EV_INFO, "test", "Syslog test message from water heater monitor");
+    // Also emit a real heartbeat, so the exact line the collector will see on
+    // an ongoing basis can be verified now rather than after waiting an interval
+    g_lastHeartbeat = 0;
+    sendHeartbeat();
+  }
+  if (g_calibrateRequested) {
+    g_calibrateRequested = false;
+    g_calibTotal = 0;
+    g_calibRemaining = 10;
+  }
+  if (g_restartAt != 0 && (long)(millis() - g_restartAt) >= 0 && !g_moSavePending) {
+    ESP.restart();
+  }
+}
+
+/*******************************************************************************
  * SETUP
  ******************************************************************************/
 void setup() {
+  // Capture last run's breadcrumb before anything overwrites it
+  if (g_rtcMagic == BREADCRUMB_MAGIC && g_rtcStage < sizeof(STAGE_NAMES) / sizeof(STAGE_NAMES[0])) {
+    g_prevValid = true;
+    g_prevStage = g_rtcStage;
+    g_prevUptimeSec = g_rtcUptimeSec;
+  }
+  g_rtcMagic = BREADCRUMB_MAGIC;
+  g_rtcStage = ST_SETUP;
+  g_rtcUptimeSec = 0;
+
   Serial.begin(115200);
+  // USB CDC with no host attached: drop output instead of blocking loop()
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.setTxTimeoutMs(0);
+#endif
   delay(500);
-  Serial.println("\n=== Water Heater Monitor v1.0 ===");
+  Serial.println("\n=== Water Heater Monitor v" FW_VERSION " ===");
+  appHealthInit();
 
   g_bootTime = millis();
 
@@ -3657,6 +4012,7 @@ void setup() {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
       Serial.printf("  Found device at 0x%02X\n", addr);
+      if (g_i2cFoundCount < (int)sizeof(g_i2cFound)) g_i2cFound[g_i2cFoundCount++] = addr;
     }
   }
 
@@ -3698,6 +4054,7 @@ void setup() {
            g_tslFound ? "OK" : "FAIL",
            g_ds18b20Found ? "OK" : "FAIL",
            g_wifiConnected ? "OK" : (g_apMode ? "AP" : "FAIL"));
+  reportPreviousRun();
 
   // Sensor failures are logged separately so they are filterable as their own
   // category rather than buried inside the boot line.
@@ -3709,16 +4066,22 @@ void setup() {
  * MAIN LOOP
  ******************************************************************************/
 void loop() {
-  // Flash detection — high frequency sampling
+  g_rtcUptimeSec = (millis() - g_bootTime) / 1000;
+
+  // Flash detection — samples as the sensor's conversions complete
+  g_rtcStage = ST_FLASH;
   processFlashDetection();
 
   // Temperature reading
+  g_rtcStage = ST_TEMP;
   processTemperature();
 
   // Button handling
+  g_rtcStage = ST_BUTTONS;
   processButtons();
 
   // Display update (~30 fps max, throttled by sprite push)
+  g_rtcStage = ST_DISPLAY;
   static unsigned long lastDisplayUpdate = 0;
   if (millis() - lastDisplayUpdate >= 200) {  // 5 fps is plenty
     updateDisplay();
@@ -3726,10 +4089,12 @@ void loop() {
   }
 
   // Wi-Fi CSI motion sensing
+  g_rtcStage = ST_MOTION;
   motionTick();
 
   // Backlight: dim hours + motion screen-off. 250 ms so a fault or a button
   // press lights a dark display right away.
+  g_rtcStage = ST_BACKLIGHT;
   static unsigned long lastBLCheck = 0;
   if (millis() - lastBLCheck >= 250) {
     updateBacklight();
@@ -3737,30 +4102,46 @@ void loop() {
   }
 
   // Home Assistant push
+  g_rtcStage = ST_HA;
   pushToHomeAssistant();
 
   // Periodic syslog heartbeat (dead-man's switch)
+  g_rtcStage = ST_HEARTBEAT;
   sendHeartbeat();
 
   // ElegantOTA
+  g_rtcStage = ST_OTA;
   ElegantOTA.loop();
   ArduinoOTA.handle();
+  appHealthCheck();
 
   // Backfill pre-NTP events once the clock lands (may be well after boot if
   // WiFi took a while to come up)
+  g_rtcStage = ST_TIMESYNC;
   checkTimeSync();
 
+  // The chart's hours pass whether or not the burner runs
+  static unsigned long lastHourCheck = 0;
+  if (millis() - lastHourCheck >= 60000) {
+    lastHourCheck = millis();
+    advanceHourlyBuckets();
+  }
+
   // Handle a requested filesystem format, safely outside the async handler
+  g_rtcStage = ST_WEBWORK;
   if (g_formatRequested) {
     g_formatRequested = false;
     performEventLogFormat();
   }
+  processWebRequests();
 
   // AP-mode fallback must not be a one-way door. Previously, once a boot-time
   // association failed the device served its own AP forever and could only be
   // recovered physically — fatal for an OTA-only device on a marginal signal.
+  g_rtcStage = ST_APRETRY;
   retryStationFromAP();
 
+  g_rtcStage = ST_WIFI;
   // WiFi reconnect check
   static unsigned long lastWiFiCheck = 0;
   static uint8_t wifiFailStreak = 0;
@@ -3801,5 +4182,7 @@ void loop() {
 
   // Reachability watchdog. Runs after the association check so that a station
   // which is merely associated — not usable — still gets caught.
+  g_rtcStage = ST_LINK;
   checkLinkHealth();
+  delay(1);   // Sampling no longer sleeps in the sensor library; yield to lower-priority tasks
 }

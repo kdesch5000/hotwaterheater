@@ -347,6 +347,12 @@ def test_noisy_readings():
     print("PASS: Noisy readings don't cause false detections")
 
 
+def test_motion_sensing_defaults_off():
+    """CSI crashes the board inside the Wi-Fi driver, so a fresh config must not enable it."""
+    with open(os.path.join(SKETCH_DIR, "water_heater_monitor.ino")) as f:
+        assert 'g_prefs.getUChar("moMode", 0)' in f.read()
+
+
 def test_compile():
     """Test that the Arduino sketch compiles without errors."""
     result = subprocess.run(
