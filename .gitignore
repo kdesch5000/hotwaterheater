@@ -12,3 +12,8 @@ crash-elf/
 
 # Site-specific firmware defaults (see local_config.example.h)
 water_heater_monitor/local_config.h
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
